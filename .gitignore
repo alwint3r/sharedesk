@@ -1,0 +1,37 @@
+# CMake build directories and generated files
+/build/
+/out/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+/Makefile
+/build.ninja
+/.ninja_deps
+/.ninja_log
+
+# Compiler output (including accidental in-source builds)
+/sharedesk-host
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dSYM/
+
+# Local credentials; keep the VNC password outside this repository
+vnc-password
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
