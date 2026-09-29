@@ -1,4 +1,4 @@
-# Sharedesk (first milestone)
+# Sharedesk
 
 A small remote-desktop **host for an already-started Ubuntu X11 session**. It captures the existing desktop and accepts keyboard/mouse input. On the Mac, use the built-in Screen Sharing app as the viewer. No separate server or public inbound port is needed.
 
@@ -23,9 +23,9 @@ Both devices must be on your Tailscale network. Restrict access to the Ubuntu ho
 Create a *new* VNC password file on Ubuntu. VNC authentication uses only **1–8 ASCII characters**; it is not a substitute for Tailscale's device identity and access policy. The file contains the password as plain text, not the format produced by `x11vnc -storepasswd`:
 
 ```sh
-install -d -m 700 "$HOME/.config/sharedesk"
+install -d -m 700 "$HOME/.sharedesk"
 read -r -s -p 'New VNC password (1-8 ASCII characters): ' pw; printf '\n'
-(umask 077; printf '%s\n' "$pw" > "$HOME/.config/sharedesk/vnc-password")
+(umask 077; printf '%s\n' "$pw" > "$HOME/.sharedesk/vnc-password")
 unset pw
 ```
 
@@ -33,12 +33,32 @@ From a terminal **in the logged-in Ubuntu X11 desktop**, run:
 
 ```sh
 ./build/sharedesk-host --listen "$(tailscale ip -4)" \
-  --password-file "$HOME/.config/sharedesk/vnc-password" --port 5901
+  --password-file "$HOME/.sharedesk/vnc-password" --port 5901
 ```
 
 Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. From the Mac, open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. Restart it if the desktop resolution changes. If it cannot bind, check whether another process already uses that port.
 
-Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. The host runs in the foreground and starts only when you run it; automatic startup is not part of this milestone. Ubuntu must remain awake for remote access, but its screen may be locked.
+Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Ubuntu must remain awake for remote access, but its screen may be locked.
+
+## Start automatically with the Ubuntu X11 desktop
+
+After the manual connection works, install per-user graphical-session autostart **on Ubuntu** (not on the Mac). Use the same password file and port that worked manually:
+
+```sh
+python3 scripts/install-autostart.py --password-file "$HOME/.sharedesk/vnc-password" --port 5901
+```
+
+Do not use `sudo`. The installer copies the current build to `~/.local/libexec/sharedesk/` and creates `~/.config/autostart/sharedesk-host.desktop`. The desktop entry stays under `.config/autostart` because the graphical session looks there; the VNC password remains in `~/.sharedesk`. The installer waits for a Tailscale IPv4 address, then starts the host in the logged-in **X11** session. It does not log in at boot, restart a failed host, or keep the session awake. After rebuilding, run the installer again to copy the new executable.
+
+Stop your manually started host with Ctrl+C before checking autostart at the **next graphical login**; otherwise both processes will try to use port 5901. If it does not connect, check `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set) and verify the session is X11. If the desktop resolution changes, the host exits; start it again or log out and back in.
+
+To disable autostart and remove its installed executable:
+
+```sh
+python3 scripts/install-autostart.py --remove
+```
+
+This does not stop a host that is already running, and it leaves the password file and logs intact. Use `pgrep -a sharedesk-host` to find a running host and `kill <PID>` to stop it if needed.
 
 ## Current limits
 
