@@ -4,6 +4,7 @@
 #include <X11/Xproto.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
+#include <X11/extensions/Xfixes.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -30,6 +31,9 @@ typedef struct {
     int width;
     int height;
     int resize_unavailable;
+    int cursor_event_base;
+    int cursor_dirty;
+    int cursor_read_failed;
     int buttons;
     unsigned char keys[256];
 } Host;
@@ -184,6 +188,122 @@ static uint32_t channel(unsigned long pixel, unsigned long mask) {
     return (uint32_t)((value * 255UL) / mask);
 }
 
+static int cursor_in_framebuffer(rfbClientPtr client) {
+    rfbCursorPtr cursor = client->screen->cursor;
+    if (!cursor) return 0;
+    size_t bytes = (size_t)cursor->width * cursor->height * 4 +
+                   (size_t)((cursor->width + 7) / 8) * cursor->height +
+                   sz_rfbFramebufferUpdateRectHeader + sz_rfbXCursorColors;
+    /* LibVNCServer cannot send a cursor larger than its update buffer. */
+    return !client->enableCursorPosUpdates || bytes > UPDATE_BUF_SIZE;
+}
+
+static rfbCursorPtr viewer_cursor(rfbClientPtr client) {
+    /* Hide the viewer's cursor when its image is already in the screen stream. */
+    return cursor_in_framebuffer(client) ? NULL : client->screen->cursor;
+}
+
+static int update_cursor(Host *host) {
+    while (XPending(host->display)) {
+        XEvent event;
+        XNextEvent(host->display, &event);
+        if (event.type == host->cursor_event_base + XFixesCursorNotify) {
+            host->cursor_dirty = 1;
+        } else if (event.type == MappingNotify) {
+            XRefreshKeyboardMapping(&event.xmapping);
+        }
+    }
+
+    int result = 0;
+    if (host->cursor_dirty) {
+        host->cursor_dirty = 0;
+        XFixesCursorImage *image = XFixesGetCursorImage(host->display);
+        if (!image) {
+            if (!host->cursor_read_failed) {
+                fprintf(stderr, "Cannot read X11 cursor image; keeping the previous cursor and retrying\n");
+            }
+            host->cursor_read_failed = 1;
+            host->cursor_dirty = 1;
+            result = -1;
+        } else {
+            host->cursor_read_failed = 0;
+            if (image->width > 1024 || image->height > 1024) {
+                fprintf(stderr, "Ignoring unsupported %ux%u cursor (maximum 1024x1024)\n",
+                        image->width, image->height);
+                result = -1;
+            } else {
+                unsigned int width = image->width ? image->width : 1;
+                unsigned int height = image->height ? image->height : 1;
+                size_t count = (size_t)width * height;
+                size_t mask_stride = (width + 7) / 8;
+                rfbCursorPtr cursor = calloc(1, sizeof *cursor);
+                if (cursor) {
+                    cursor->cleanup = TRUE;
+                    cursor->cleanupMask = TRUE;
+                    cursor->cleanupRichSource = TRUE;
+                    cursor->width = (unsigned short)width;
+                    cursor->height = (unsigned short)height;
+                    cursor->xhot = image->xhot < width ? image->xhot : 0;
+                    cursor->yhot = image->yhot < height ? image->yhot : 0;
+                    cursor->richSource = calloc(count, 4);
+                    cursor->alphaSource = calloc(count, 1);
+                    cursor->mask = calloc(mask_stride, height);
+                }
+                if (!cursor || !cursor->richSource || !cursor->alphaSource || !cursor->mask) {
+                    rfbFreeCursor(cursor);
+                    fprintf(stderr, "Cannot allocate X11 cursor image; keeping the previous cursor\n");
+                    result = -1;
+                } else {
+                    for (unsigned int row = 0; row < image->height; ++row) {
+                        for (unsigned int col = 0; col < image->width; ++col) {
+                            size_t offset = (size_t)row * width + col;
+                            uint32_t argb = (uint32_t)image->pixels[offset];
+                            uint32_t alpha = argb >> 24;
+                            uint32_t rgb = 0;
+                            /* XFixes supplies premultiplied ARGB. VNC rich
+                             * cursors need straight RGB in our server format. */
+                            for (int shift = 0; shift <= 16; shift += 8) {
+                                uint32_t value = (argb >> shift) & 255;
+                                value = alpha ? (value * 255 + alpha / 2) / alpha : 0;
+                                if (value > 255) value = 255;
+                                rgb |= value << shift;
+                            }
+                            ((uint32_t *)cursor->richSource)[offset] = rgb;
+                            cursor->alphaSource[offset] = (unsigned char)alpha;
+                            /* Standard VNC cursor masks have one-bit opacity. */
+                            if (alpha >= 128) {
+                                cursor->mask[row * mask_stride + col / 8] |=
+                                    (unsigned char)(0x80 >> (col % 8));
+                            }
+                        }
+                    }
+                    /* Ownership transfers to LibVNCServer, which frees this
+                     * cursor on replacement and during screen cleanup. */
+                    rfbSetCursor(host->screen, cursor);
+                }
+            }
+            XFree(image);
+        }
+    }
+
+    Window root, child;
+    int x, y, window_x, window_y;
+    unsigned int mask;
+    if (XQueryPointer(host->display, host->root, &root, &child, &x, &y,
+                      &window_x, &window_y, &mask)) {
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x >= host->width) x = host->width - 1;
+        if (y >= host->height) y = host->height - 1;
+        if (x != host->screen->cursorX || y != host->screen->cursorY) {
+            host->screen->cursorX = x;
+            host->screen->cursorY = y;
+            if (host->client) host->client->cursorWasMoved = TRUE;
+        }
+    }
+    return result;
+}
+
 static int pause_for_resize(Host *host, unsigned int width, unsigned int height,
                             const char *reason) {
     if (!host->resize_unavailable) {
@@ -277,6 +397,36 @@ static int capture(Host *host) {
         }
     }
     XDestroyImage(image);
+
+    if (host->client && host->client->enableCursorShapeUpdates && cursor_in_framebuffer(host->client)) {
+        rfbCursorPtr cursor = host->screen->cursor;
+        int left = host->screen->cursorX - cursor->xhot;
+        int top = host->screen->cursorY - cursor->yhot;
+        int start_x = left < 0 ? -left : 0;
+        int start_y = top < 0 ? -top : 0;
+        int end_x = left + cursor->width > (int)width ? (int)width - left : cursor->width;
+        int end_y = top + cursor->height > (int)height ? (int)height - top : cursor->height;
+        /* Compose onto the fresh capture, not the previous frame, so moving or
+         * changing the cursor restores its old background without a trail. */
+        for (int row = start_y; row < end_y; ++row) {
+            for (int col = start_x; col < end_x; ++col) {
+                size_t offset = (size_t)row * cursor->width + col;
+                uint32_t alpha = cursor->alphaSource ? cursor->alphaSource[offset] :
+                    ((cursor->mask[row * ((cursor->width + 7) / 8) + col / 8] &
+                      (0x80 >> (col % 8))) ? 255 : 0);
+                if (!alpha) continue;
+                uint32_t source = ((uint32_t *)cursor->richSource)[offset];
+                uint32_t *destination = next_pixels + (size_t)(top + row) * width + (size_t)(left + col);
+                uint32_t rgb = 0;
+                for (int shift = 0; shift <= 16; shift += 8) {
+                    uint32_t foreground = (source >> shift) & 255;
+                    uint32_t background = (*destination >> shift) & 255;
+                    rgb |= ((foreground * alpha + background * (255 - alpha) + 127) / 255) << shift;
+                }
+                *destination = rgb;
+            }
+        }
+    }
 
     if (host->resize_unavailable) {
         fprintf(stderr, "Desktop capture resumed\n");
@@ -375,7 +525,17 @@ int main(int argc, char **argv) {
         XCloseDisplay(host.display);
         return 1;
     }
+    major = XFIXES_MAJOR;
+    minor = XFIXES_MINOR;
+    if (!XFixesQueryExtension(host.display, &host.cursor_event_base, &error_base) ||
+        !XFixesQueryVersion(host.display, &major, &minor) || major < 1) {
+        fprintf(stderr, "X11 XFIXES cursor extension is unavailable\n");
+        XCloseDisplay(host.display);
+        return 1;
+    }
     host.root = DefaultRootWindow(host.display);
+    XFixesSelectCursorInput(host.display, host.root, XFixesDisplayCursorNotifyMask);
+    host.cursor_dirty = 1;
     if (capture(&host) != 0) {
         free(host.pixels);
         free(host.next_pixels);
@@ -420,6 +580,20 @@ int main(int argc, char **argv) {
     host.screen->newClientHook = new_client;
     host.screen->kbdAddEvent = keyboard_event;
     host.screen->ptrAddEvent = pointer_event;
+    host.screen->getCursorPtr = viewer_cursor;
+    /* A cursor image can be unavailable during session/display startup. Keep
+     * remote access available with an invisible cursor until a refresh succeeds. */
+    rfbCursorPtr initial_cursor = rfbMakeXCursor(1, 1, " ", " ");
+    if (!initial_cursor) {
+        fprintf(stderr, "Cannot initialize VNC cursor\n");
+        rfbScreenCleanup(host.screen);
+        free(host.pixels);
+        free(host.next_pixels);
+        XCloseDisplay(host.display);
+        return 1;
+    }
+    rfbSetCursor(host.screen, initial_cursor);
+    (void)update_cursor(&host);
 
     struct sigaction action = {0};
     action.sa_handler = stop_on_signal;
@@ -442,6 +616,10 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t next_capture = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec + interval_ns;
     while (!stopping && rfbIsActive(host.screen)) {
+        /* Shape notifications are coalesced; local position is polled even
+         * without screen damage. Missing images retry; other refresh failures
+         * retain the previous cursor until the next shape notification. */
+        (void)update_cursor(&host);
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t current = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
         if (current >= next_capture) {

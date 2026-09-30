@@ -2,14 +2,14 @@
 
 A small remote-desktop **host for an already-started Ubuntu X11 session**. It captures the existing desktop and accepts keyboard/mouse input. On the Mac, use the built-in Screen Sharing app as the viewer. No separate server or public inbound port is needed.
 
-This is an early, polling-based VNC host, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet.
+This is an early, polling-based VNC host, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST and XFIXES extensions; Ubuntu's normal Xorg session provides both.
 
 ## Build on Ubuntu 22.04
 
 Install build dependencies:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libvncserver-dev libx11-dev libxtst-dev
+sudo apt install build-essential cmake pkg-config libvncserver-dev libx11-dev libxtst-dev libxfixes-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
@@ -40,6 +40,8 @@ Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. Fr
 
 The host follows Ubuntu desktop-size changes without restarting. Viewers that support VNC desktop resizing receive the new size and a full repaint. A viewer without resize support is disconnected and can reconnect at the new size; the host keeps listening.
 
+Ubuntu's cursor shape, hotspot (the pixel used for clicks) and position are tracked through X11's XFIXES extension and pointer queries. Viewers that support both cursor-shape and cursor-position updates render it locally. For shape-only viewers, the host hides the viewer cursor and draws Ubuntu's cursor into the screen stream instead, including local mouse movement. This fallback updates at `--fps`; try `--fps 30` if cursor motion feels slow. Viewers without cursor-shape support use LibVNCServer's screen-drawn cursor. If the cursor image is temporarily unavailable, the host keeps listening and retries the read.
+
 Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Ubuntu must remain awake for remote access, but its screen may be locked.
 
 ## Start automatically with the Ubuntu X11 desktop
@@ -66,6 +68,7 @@ This does not stop a host that is already running, and it leaves the password fi
 
 - Desktop size is limited to 8192×8192 pixels. If a running desktop exceeds that limit, or replacement framebuffers cannot be allocated, the host disconnects the viewer and pauses capture. It keeps listening and retries until the desktop can be captured again.
 - While a viewer is connected, polls the full screen and sends changed 64×64 regions; expect more CPU use and less fluid motion than a video-based remote desktop.
-- Basic X11 keys, pointer buttons and scrolling. Keyboard mapping depends on the Ubuntu X11 layout; some Mac-specific keys may not map. Local pointer movement and custom cursor shapes may not appear in the video.
+- Basic X11 keys, pointer buttons and scrolling. Keyboard mapping depends on the Ubuntu X11 layout; some Mac-specific keys may not map.
+- Standard VNC cursor-shape updates have one-bit transparency, so soft edges are approximate. Screen-drawn cursors preserve alpha blending. Cursor images above 1024×1024 pixels are ignored; cursors too large for LibVNCServer's cursor-update buffer are drawn in the screen stream for shape-capable viewers.
 - One viewer at a time. No audio, clipboard synchronization, file transfer, or login-screen access.
 - Existing X11 session only; after reboot, a user must start a desktop session locally.
