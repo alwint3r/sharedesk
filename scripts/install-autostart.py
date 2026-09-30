@@ -28,6 +28,7 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parent.parent / "build/sharedesk-host")
     parser.add_argument("--port", type=int, default=5901)
     parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--stats", action="store_true", help="enable performance summaries every five seconds")
     parser.add_argument("--remove", action="store_true", help="remove autostart and installed executable")
     args = parser.parse_args()
     if os.geteuid() == 0:
@@ -87,7 +88,7 @@ printf 'Waiting for Tailscale IPv4 address on %s\\n' "$(date)"
 while :; do
     ip=$(tailscale ip -4 2>/dev/null || true)
     if [ -n "$ip" ]; then
-        exec {shlex.quote(str(installed_binary))} --listen "$ip" --password-file {shlex.quote(str(password_file))} --port {args.port} --fps {args.fps}
+        exec {shlex.quote(str(installed_binary))} --listen "$ip" --password-file {shlex.quote(str(password_file))} --port {args.port} --fps {args.fps}{' --stats' if args.stats else ''}
     fi
     sleep 5
 done

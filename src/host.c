@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <rfb/rfb.h>
 #include <signal.h>
@@ -15,12 +16,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+typedef struct {
+    int enabled;
+    int64_t started_ns;
+    int64_t cpu_started_us;
+    uint64_t captures;
+    uint64_t capture_ns;
+    uint64_t capture_max_ns;
+    uint64_t grab_ns;
+    uint64_t grab_max_ns;
+    uint64_t sent_bytes;
+    uint32_t last_sent_bytes;
+} Stats;
+
 /* A single-threaded X11 host. LibVNCServer owns the client sockets; we own the
- * X connection and framebuffer. All callbacks run from rfbProcessEvents(). */
+ * X connection, framebuffer and per-report statistics. All callbacks run from
+ * rfbProcessEvents(); statistics stay in the same foreground event loop. */
 typedef struct {
     Display *display;
     Window root;
@@ -36,6 +52,7 @@ typedef struct {
     int cursor_read_failed;
     int buttons;
     unsigned char keys[256];
+    Stats stats;
 } Host;
 
 static volatile sig_atomic_t stopping = 0;
@@ -43,6 +60,51 @@ static volatile sig_atomic_t stopping = 0;
 static void stop_on_signal(int signal_number) {
     (void)signal_number;
     stopping = 1;
+}
+
+static int64_t monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("Reading monotonic clock");
+        exit(EXIT_FAILURE); /* The event loop also needs this clock to run. */
+    }
+    return (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+/* Returns process CPU time in microseconds, or -1 when it is unavailable. */
+static int64_t process_cpu_us(void) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+    return (int64_t)usage.ru_utime.tv_sec * 1000000 + usage.ru_utime.tv_usec +
+           (int64_t)usage.ru_stime.tv_sec * 1000000 + usage.ru_stime.tv_usec;
+}
+
+static void record_capture(Host *host, int64_t started_ns, uint64_t grab_ns) {
+    Stats *stats = &host->stats;
+    if (!stats->enabled) return;
+    uint64_t elapsed = (uint64_t)(monotonic_ns() - started_ns);
+    ++stats->captures;
+    stats->capture_ns += elapsed;
+    if (elapsed > stats->capture_max_ns) stats->capture_max_ns = elapsed;
+    stats->grab_ns += grab_ns;
+    if (grab_ns > stats->grab_max_ns) stats->grab_max_ns = grab_ns;
+}
+
+static void sample_client_bytes(Host *host, rfbClientPtr client) {
+    Stats *stats = &host->stats;
+    if (!stats->enabled || client != host->client) return;
+    /* LibVNCServer's counter is 32-bit. Sample after every framebuffer update
+     * (each is smaller than 4 GiB) so unsigned subtraction handles a wrap.
+     * Keep our interval total in 64 bits and never reset the library's counters. */
+    uint32_t total = (uint32_t)rfbStatGetSentBytes(client);
+    stats->sent_bytes += (uint32_t)(total - stats->last_sent_bytes);
+    stats->last_sent_bytes = total;
+}
+
+static void display_finished(rfbClientPtr client, int success) {
+    (void)success;
+    /* These are library-accounted bytes, not a socket-write acknowledgement. */
+    sample_client_bytes(client->screen->screenData, client);
 }
 
 static void release_input(Host *host) {
@@ -64,6 +126,8 @@ static void release_input(Host *host) {
 static void client_gone(rfbClientPtr client) {
     Host *host = client->screen->screenData;
     if (host->client == client) {
+        /* The library frees the client's statistics after this callback. */
+        sample_client_bytes(host, client);
         release_input(host);
         host->client = NULL;
         fprintf(stderr, "Viewer disconnected\n");
@@ -81,6 +145,7 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
         return RFB_CLIENT_REFUSE;
     }
     host->client = client;
+    if (host->stats.enabled) host->stats.last_sent_bytes = 0;
     client->clientGoneHook = client_gone;
     fprintf(stderr, "Viewer connected; waiting for VNC authentication\n");
     return RFB_CLIENT_ACCEPT;
@@ -331,6 +396,7 @@ static int image_error(Display *display, XErrorEvent *error) {
 }
 
 static int capture(Host *host) {
+    int64_t started_ns = host->stats.enabled ? monotonic_ns() : 0;
     Window unused_root;
     int x, y;
     unsigned int width, height, border, depth;
@@ -364,8 +430,10 @@ static int capture(Host *host) {
     /* XGetGeometry above has already completed pending X requests. Install the
      * error handler only around the synchronous image read, not input events. */
     XErrorHandler previous_handler = XSetErrorHandler(image_error);
+    int64_t grab_started_ns = host->stats.enabled ? monotonic_ns() : 0;
     XImage *image = XGetImage(host->display, host->root, 0, 0, width, height,
                              AllPlanes, ZPixmap);
+    uint64_t grab_ns = host->stats.enabled ? (uint64_t)(monotonic_ns() - grab_started_ns) : 0;
     XSetErrorHandler(previous_handler);
     if (!image) {
         if (resized) {
@@ -455,6 +523,7 @@ static int capture(Host *host) {
         host->next_pixels = next_pixels;
         host->width = (int)width;
         host->height = (int)height;
+        record_capture(host, started_ns, grab_ns);
         return 0;
     }
     /* Compare tiles to avoid sending the entire screen for a small change. */
@@ -480,20 +549,22 @@ static int capture(Host *host) {
             }
         }
     }
+    record_capture(host, started_ns, grab_ns);
     return 0;
 }
 
 int main(int argc, char **argv) {
     const char *listen_ip = NULL;
     const char *password_file = NULL;
-    int port = 5900, fps = 10;
+    int port = 5900, fps = 10, stats_enabled = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen_ip = argv[++i];
         else if (!strcmp(argv[i], "--password-file") && i + 1 < argc) password_file = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = parse_number(argv[++i], 1, 65535);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = parse_number(argv[++i], 1, 30);
+        else if (!strcmp(argv[i], "--stats")) stats_enabled = 1;
         else {
-            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> --password-file <file> [--port 5900] [--fps 10]\n", argv[0]);
+            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> --password-file <file> [--port 5900] [--fps 10] [--stats]\n", argv[0]);
             return 2;
         }
     }
@@ -581,6 +652,7 @@ int main(int argc, char **argv) {
     host.screen->kbdAddEvent = keyboard_event;
     host.screen->ptrAddEvent = pointer_event;
     host.screen->getCursorPtr = viewer_cursor;
+    if (stats_enabled) host.screen->displayFinishedHook = display_finished;
     /* A cursor image can be unavailable during session/display startup. Keep
      * remote access available with an invisible cursor until a refresh succeeds. */
     rfbCursorPtr initial_cursor = rfbMakeXCursor(1, 1, " ", " ");
@@ -612,22 +684,62 @@ int main(int argc, char **argv) {
             host.width, host.height, listen_ip, port, fps);
     int result = 0;
     int64_t interval_ns = 1000000000LL / fps;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    int64_t next_capture = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec + interval_ns;
+    int64_t started_ns = monotonic_ns();
+    int64_t next_capture = started_ns + interval_ns;
+    /* Exclude startup capture and initialization from the measurement window. */
+    host.stats.enabled = stats_enabled;
+    host.stats.started_ns = started_ns;
+    host.stats.cpu_started_us = stats_enabled ? process_cpu_us() : -1;
+    if (stats_enabled) fprintf(stderr, "Performance statistics enabled (5-second intervals)\n");
     while (!stopping && rfbIsActive(host.screen)) {
         /* Shape notifications are coalesced; local position is polled even
          * without screen damage. Missing images retry; other refresh failures
          * retain the previous cursor until the next shape notification. */
         (void)update_cursor(&host);
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t current = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t current = monotonic_ns();
         if (current >= next_capture) {
             if (capture(&host) != 0) {
                 result = 1;
                 break;
             }
             next_capture = current + interval_ns;
+        }
+        if (host.stats.enabled) {
+            Stats *stats = &host.stats;
+            int64_t report_ns = monotonic_ns();
+            int64_t elapsed_ns = report_ns - stats->started_ns;
+            if (elapsed_ns >= 5000000000LL) {
+                if (host.client) sample_client_bytes(&host, host.client);
+                double seconds = elapsed_ns / 1000000000.0;
+                char capture_ms[48] = "n/a", grab_ms[48] = "n/a", cpu[32] = "n/a";
+                if (stats->captures) {
+                    snprintf(capture_ms, sizeof capture_ms, "%.2f/%.2f",
+                             stats->capture_ns / (double)stats->captures / 1000000.0,
+                             stats->capture_max_ns / 1000000.0);
+                    snprintf(grab_ms, sizeof grab_ms, "%.2f/%.2f",
+                             stats->grab_ns / (double)stats->captures / 1000000.0,
+                             stats->grab_max_ns / 1000000.0);
+                }
+                int64_t cpu_now_us = process_cpu_us();
+                if (stats->cpu_started_us >= 0 && cpu_now_us >= stats->cpu_started_us) {
+                    snprintf(cpu, sizeof cpu, "%.1f%%",
+                             (cpu_now_us - stats->cpu_started_us) * 100.0 / (elapsed_ns / 1000.0));
+                }
+                const char *viewer = "idle";
+                if (host.client && host.client->sock != RFB_INVALID_SOCKET) {
+                    viewer = host.client->state == RFB_NORMAL ? "active" : "auth";
+                }
+                fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d captures=%" PRIu64
+                        " fps=%.1f capture_ms(avg/max)=%s grab_ms(avg/max)=%s"
+                        " vnc_bytes=%" PRIu64 " vnc_KiB/s=%.1f cpu=%s\n",
+                        seconds, viewer, host.width, host.height, stats->captures,
+                        stats->captures / seconds, capture_ms, grab_ms,
+                        stats->sent_bytes, stats->sent_bytes / seconds / 1024.0, cpu);
+                /* Preserve the current client's counter baseline across windows. */
+                *stats = (Stats){.enabled = 1, .started_ns = report_ns,
+                                 .cpu_started_us = cpu_now_us,
+                                 .last_sent_bytes = stats->last_sent_bytes};
+            }
         }
         int64_t wait_us = (next_capture - current) / 1000;
         if (wait_us > 50000) wait_us = 50000;

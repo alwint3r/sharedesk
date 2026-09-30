@@ -42,7 +42,7 @@ The host follows Ubuntu desktop-size changes without restarting. Viewers that su
 
 Ubuntu's cursor shape, hotspot (the pixel used for clicks) and position are tracked through X11's XFIXES extension and pointer queries. Viewers that support both cursor-shape and cursor-position updates render it locally. For shape-only viewers, the host hides the viewer cursor and draws Ubuntu's cursor into the screen stream instead, including local mouse movement. This fallback updates at `--fps`; try `--fps 30` if cursor motion feels slow. Viewers without cursor-shape support use LibVNCServer's screen-drawn cursor. If the cursor image is temporarily unavailable, the host keeps listening and retries the read.
 
-Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Ubuntu must remain awake for remote access, but its screen may be locked.
+Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Add `--stats` for performance summaries; see below. Ubuntu must remain awake for remote access, but its screen may be locked.
 
 ## Start automatically with the Ubuntu X11 desktop
 
@@ -63,6 +63,43 @@ python3 scripts/install-autostart.py --remove
 ```
 
 This does not stop a host that is already running, and it leaves the password file and logs intact. Use `pgrep -a sharedesk-host` to find a running host and `kill <PID>` to stop it if needed.
+
+## Performance statistics
+
+Statistics are off by default. Add `--stats` to print one summary to stderr every five seconds, including idle periods:
+
+```sh
+./build/sharedesk-host --listen "$(tailscale ip -4)" \
+  --password-file "$HOME/.sharedesk/vnc-password" --port 5901 --stats
+```
+
+For autostart, enable the same option when updating its installed copy:
+
+```sh
+python3 scripts/install-autostart.py \
+  --password-file "$HOME/.sharedesk/vnc-password" --port 5901 --stats
+```
+
+Restart the host to load the updated launcher. Autostart summaries go to `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set). To disable them, run the installer without `--stats` and restart the host. No new dependencies are needed.
+
+An example summary with illustrative values:
+
+```text
+Stats 5.0s: viewer=active size=1920x1080 captures=49 fps=9.8 capture_ms(avg/max)=8.20/12.30 grab_ms(avg/max)=5.10/7.40 vnc_bytes=245760 vnc_KiB/s=48.0 cpu=9.2%
+```
+
+| Field | Meaning |
+| --- | --- |
+| `viewer` / `size` | Current connection state (`idle`, `auth`, or `active`) and VNC framebuffer size at reporting time. |
+| `captures` / `fps` | Successful pixel captures and captures per elapsed second, including unchanged screens. This is not the viewer's displayed frame rate. Startup capture, failed reads and idle geometry checks are excluded. |
+| `capture_ms(avg/max)` | Average and maximum capture-pipeline time in milliseconds, including the X11 read, conversion, cursor composition, tile comparison and resize work. It does not time the normal framebuffer encoding/send step. |
+| `grab_ms(avg/max)` | Average and maximum time inside `XGetImage`, in milliseconds. |
+| `vnc_bytes` / `vnc_KiB/s` | LibVNCServer-accounted bytes and estimated encoded VNC traffic per second (1 KiB = 1024 bytes). Counts continue across reconnects within a reporting interval. |
+| `cpu` | Process user + system CPU time divided by elapsed time; 100% means one CPU core. Includes all host threads, but not Xorg or Tailscale CPU use. |
+
+Capture times show `n/a` when no pixels were captured; CPU shows `n/a` if process CPU accounting is unavailable. Each summary covers the actual elapsed interval, including any time before connecting or after disconnecting. An idle resize can still cause a capture. A blocked event loop can delay a summary beyond five seconds.
+
+Traffic is an estimate from the library's counters, not an exact socket or network measurement. It excludes connection-handshake traffic, TCP/Tailscale overhead and retransmissions, and may count prepared data after a failed write. These statistics do not measure end-to-end input latency. Summaries stay in your local output/logs; no telemetry is sent elsewhere.
 
 ## Current limits
 
