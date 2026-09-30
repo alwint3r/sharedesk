@@ -36,7 +36,9 @@ From a terminal **in the logged-in Ubuntu X11 desktop**, run:
   --password-file "$HOME/.sharedesk/vnc-password" --port 5901
 ```
 
-Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. From the Mac, open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. Restart it if the desktop resolution changes. If it cannot bind, check whether another process already uses that port.
+Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. From the Mac, open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. If it cannot bind, check whether another process already uses that port.
+
+The host follows Ubuntu desktop-size changes without restarting. Viewers that support VNC desktop resizing receive the new size and a full repaint. A viewer without resize support is disconnected and can reconnect at the new size; the host keeps listening.
 
 Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Ubuntu must remain awake for remote access, but its screen may be locked.
 
@@ -50,7 +52,7 @@ python3 scripts/install-autostart.py --password-file "$HOME/.sharedesk/vnc-passw
 
 Do not use `sudo`. The installer copies the current build to `~/.local/libexec/sharedesk/` and creates `~/.config/autostart/sharedesk-host.desktop`. The desktop entry stays under `.config/autostart` because the graphical session looks there; the VNC password remains in `~/.sharedesk`. The installer waits for a Tailscale IPv4 address, then starts the host in the logged-in **X11** session. It does not log in at boot, restart a failed host, or keep the session awake. After rebuilding, run the installer again to copy the new executable.
 
-Stop your manually started host with Ctrl+C before checking autostart at the **next graphical login**; otherwise both processes will try to use port 5901. If it does not connect, check `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set) and verify the session is X11. If the desktop resolution changes, the host exits; start it again or log out and back in.
+Stop your manually started host with Ctrl+C before checking autostart at the **next graphical login**; otherwise both processes will try to use port 5901. If it does not connect, check `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set) and verify the session is X11. Resolution changes do not require restarting the host. To check this, change the resolution in Ubuntu's Display settings while connected, then confirm the viewer follows the new size and mouse input still works.
 
 To disable autostart and remove its installed executable:
 
@@ -62,7 +64,7 @@ This does not stop a host that is already running, and it leaves the password fi
 
 ## Current limits
 
-- Fixed desktop size per run; resolution changes stop the host with an error.
+- Desktop size is limited to 8192×8192 pixels. If a running desktop exceeds that limit, or replacement framebuffers cannot be allocated, the host disconnects the viewer and pauses capture. It keeps listening and retries until the desktop can be captured again.
 - While a viewer is connected, polls the full screen and sends changed 64×64 regions; expect more CPU use and less fluid motion than a video-based remote desktop.
 - Basic X11 keys, pointer buttons and scrolling. Keyboard mapping depends on the Ubuntu X11 layout; some Mac-specific keys may not map. Local pointer movement and custom cursor shapes may not appear in the video.
 - One viewer at a time. No audio, clipboard synchronization, file transfer, or login-screen access.

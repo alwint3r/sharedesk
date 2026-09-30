@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
+#include <X11/Xproto.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
 #include <arpa/inet.h>
@@ -28,6 +29,7 @@ typedef struct {
     uint32_t *next_pixels;
     int width;
     int height;
+    int resize_unavailable;
     int buttons;
     unsigned char keys[256];
 } Host;
@@ -66,6 +68,10 @@ static void client_gone(rfbClientPtr client) {
 
 static enum rfbNewClientAction new_client(rfbClientPtr client) {
     Host *host = client->screen->screenData;
+    if (host->resize_unavailable) {
+        fprintf(stderr, "Rejecting viewer while desktop capture is unavailable\n");
+        return RFB_CLIENT_REFUSE;
+    }
     if (host->client != NULL) {
         fprintf(stderr, "Rejecting a second viewer\n");
         return RFB_CLIENT_REFUSE;
@@ -178,35 +184,92 @@ static uint32_t channel(unsigned long pixel, unsigned long mask) {
     return (uint32_t)((value * 255UL) / mask);
 }
 
-static int capture(Host *host, int first_frame) {
+static int pause_for_resize(Host *host, unsigned int width, unsigned int height,
+                            const char *reason) {
+    if (!host->resize_unavailable) {
+        fprintf(stderr, "Cannot capture %ux%u desktop: %s\n", width, height, reason);
+        host->resize_unavailable = 1;
+        if (host->client) {
+            release_input(host);
+            rfbCloseClient(host->client);
+        }
+        if (host->screen) fprintf(stderr, "Waiting for a capturable desktop; host is still listening\n");
+    }
+    return host->screen ? 0 : -1;
+}
+
+static int image_error(Display *display, XErrorEvent *error) {
+    /* The root can shrink between XGetGeometry and XGetImage. Do not let
+     * Xlib's default error handler terminate the host for this race. */
+    if (error->request_code == X_GetImage &&
+        (error->error_code == BadMatch || error->error_code == BadValue)) return 0;
+    char message[128];
+    XGetErrorText(display, error->error_code, message, sizeof message);
+    fprintf(stderr, "X11 capture error: %s (request %u)\n", message, error->request_code);
+    stopping = 1;
+    return 0;
+}
+
+static int capture(Host *host) {
     Window unused_root;
     int x, y;
     unsigned int width, height, border, depth;
     if (!XGetGeometry(host->display, host->root, &unused_root, &x, &y,
-                      &width, &height, &border, &depth) ||
-        width != (unsigned int)host->width || height != (unsigned int)host->height) {
-        fprintf(stderr, "Display size changed or session ended; restart the host\n");
+                      &width, &height, &border, &depth)) {
+        fprintf(stderr, "Cannot query X11 desktop; session may have ended\n");
         return -1;
     }
+    int resized = width != (unsigned int)host->width || height != (unsigned int)host->height;
+    /* Check geometry even while idle so the next viewer gets the current size,
+     * but avoid reading screen pixels without a viewer unless resizing. */
+    if (!resized && !host->client && !host->resize_unavailable) return 0;
+
+    uint32_t *pixels = host->pixels;
+    uint32_t *next_pixels = host->next_pixels;
+    if (resized) {
+        if (width < 1 || height < 1 || width > 8192 || height > 8192 ||
+            (size_t)width * height > INT_MAX / 4) {
+            return pause_for_resize(host, width, height, "unsupported size (maximum 8192x8192)");
+        }
+        size_t bytes = (size_t)width * height * 4;
+        pixels = malloc(bytes);
+        next_pixels = malloc(bytes);
+        if (!pixels || !next_pixels) {
+            free(pixels);
+            free(next_pixels);
+            return pause_for_resize(host, width, height, "cannot allocate replacement framebuffers");
+        }
+    }
+
+    /* XGetGeometry above has already completed pending X requests. Install the
+     * error handler only around the synchronous image read, not input events. */
+    XErrorHandler previous_handler = XSetErrorHandler(image_error);
     XImage *image = XGetImage(host->display, host->root, 0, 0, width, height,
                              AllPlanes, ZPixmap);
+    XSetErrorHandler(previous_handler);
     if (!image) {
-        fprintf(stderr, "XGetImage failed; check access to the X11 session\n");
+        if (resized) {
+            free(pixels);
+            free(next_pixels);
+        }
+        /* On a running host, retry with fresh geometry on the next capture. */
+        if (host->screen && !stopping) return 0;
+        fprintf(stderr, "XGetImage failed while opening the X11 desktop\n");
         return -1;
     }
 
     if (image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
         image->red_mask == 0x00ff0000 && image->green_mask == 0x0000ff00 &&
         image->blue_mask == 0x000000ff) {
-        for (int row = 0; row < host->height; ++row) {
-            memcpy(host->next_pixels + (size_t)row * width,
+        for (unsigned int row = 0; row < height; ++row) {
+            memcpy(next_pixels + (size_t)row * width,
                    image->data + (size_t)row * image->bytes_per_line, width * 4);
         }
     } else {
-        for (int row = 0; row < host->height; ++row) {
-            for (int col = 0; col < host->width; ++col) {
+        for (unsigned int row = 0; row < height; ++row) {
+            for (unsigned int col = 0; col < width; ++col) {
                 unsigned long pixel = XGetPixel(image, col, row);
-                host->next_pixels[(size_t)row * width + col] =
+                next_pixels[(size_t)row * width + col] =
                     (channel(pixel, image->red_mask) << 16) |
                     (channel(pixel, image->green_mask) << 8) |
                     channel(pixel, image->blue_mask);
@@ -215,8 +278,33 @@ static int capture(Host *host, int first_frame) {
     }
     XDestroyImage(image);
 
-    if (first_frame) {
-        memcpy(host->pixels, host->next_pixels, (size_t)width * height * 4);
+    if (host->resize_unavailable) {
+        fprintf(stderr, "Desktop capture resumed\n");
+        host->resize_unavailable = 0;
+    }
+    if (resized) {
+        memcpy(pixels, next_pixels, (size_t)width * height * 4);
+        if (host->screen) {
+            if (host->client && host->client->state == RFB_NORMAL && !host->client->useNewFBSize) {
+                fprintf(stderr, "Viewer does not support resizing; disconnecting it so it can reconnect\n");
+                release_input(host);
+                rfbCloseClient(host->client);
+            }
+            /* Publish only a fully captured frame. LibVNCServer resets its
+             * pixel format here; restore ours and rebuild client translation. */
+            rfbPixelFormat format = host->screen->serverFormat;
+            rfbNewFramebuffer(host->screen, (char *)pixels, (int)width, (int)height, 8, 3, 4);
+            host->screen->serverFormat = format;
+            if (host->client) host->screen->setTranslateFunction(host->client);
+            fprintf(stderr, "Desktop resized from %dx%d to %ux%u\n",
+                    host->width, host->height, width, height);
+        }
+        free(host->pixels);
+        free(host->next_pixels);
+        host->pixels = pixels;
+        host->next_pixels = next_pixels;
+        host->width = (int)width;
+        host->height = (int)height;
         return 0;
     }
     /* Compare tiles to avoid sending the entire screen for a small change. */
@@ -288,19 +376,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     host.root = DefaultRootWindow(host.display);
-    host.width = DisplayWidth(host.display, DefaultScreen(host.display));
-    host.height = DisplayHeight(host.display, DefaultScreen(host.display));
-    if (host.width < 1 || host.height < 1 || host.width > 8192 || host.height > 8192 ||
-        (size_t)host.width * host.height > INT_MAX / 4) {
-        fprintf(stderr, "Unsupported desktop size: %dx%d\n", host.width, host.height);
-        XCloseDisplay(host.display);
-        return 1;
-    }
-    size_t bytes = (size_t)host.width * host.height * 4;
-    host.pixels = malloc(bytes);
-    host.next_pixels = malloc(bytes);
-    if (!host.pixels || !host.next_pixels) {
-        fprintf(stderr, "Cannot allocate two %zu-byte framebuffers\n", bytes);
+    if (capture(&host) != 0) {
         free(host.pixels);
         free(host.next_pixels);
         XCloseDisplay(host.display);
@@ -345,13 +421,6 @@ int main(int argc, char **argv) {
     host.screen->kbdAddEvent = keyboard_event;
     host.screen->ptrAddEvent = pointer_event;
 
-    if (capture(&host, 1) != 0) {
-        rfbScreenCleanup(host.screen);
-        free(host.pixels);
-        free(host.next_pixels);
-        XCloseDisplay(host.display);
-        return 1;
-    }
     struct sigaction action = {0};
     action.sa_handler = stop_on_signal;
     sigaction(SIGINT, &action, NULL);
@@ -376,8 +445,7 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t current = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
         if (current >= next_capture) {
-            /* The X11 read is expensive; leave the desktop idle without a viewer. */
-            if (host.client && capture(&host, 0) != 0) {
+            if (capture(&host) != 0) {
                 result = 1;
                 break;
             }
