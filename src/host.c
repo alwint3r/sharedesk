@@ -741,7 +741,9 @@ int main(int argc, char **argv) {
                                  .last_sent_bytes = stats->last_sent_bytes};
             }
         }
-        int64_t wait_us = (next_capture - current) / 1000;
+        /* Capture and reporting may have consumed part or all of the interval.
+         * Wait only for the time remaining until the next capture deadline. */
+        int64_t wait_us = (next_capture - monotonic_ns()) / 1000;
         if (wait_us > 50000) wait_us = 50000;
         if (wait_us < 1000) wait_us = 1000;
         rfbProcessEvents(host.screen, (long)wait_us);
