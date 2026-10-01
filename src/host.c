@@ -5,6 +5,8 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/XShm.h>
+#include <X11/extensions/shmproto.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -44,6 +47,16 @@ typedef struct {
     rfbClientPtr client;
     uint32_t *pixels;
     uint32_t *next_pixels;
+    /* Persistent raw capture storage, never borrowed by LibVNCServer. The
+     * image metadata and SysV mapping belong to this host; Xorg writes only
+     * during the synchronous XShmGetImage call. */
+    XImage *shm_image;
+    XShmSegmentInfo shm_segment;
+    int shm_enabled;
+    int shm_opcode;
+    int shm_attached;
+    int shm_marked;
+    int shm_error;
     int width;
     int height;
     int resize_unavailable;
@@ -56,6 +69,9 @@ typedef struct {
 } Host;
 
 static volatile sig_atomic_t stopping = 0;
+/* Xlib error handlers have no context argument. This borrowed pointer exists
+ * only while trapping our own capture requests in the single-threaded loop. */
+static Host *capture_error_host;
 
 static void stop_on_signal(int signal_number) {
     (void)signal_number;
@@ -384,6 +400,15 @@ static int pause_for_resize(Host *host, unsigned int width, unsigned int height,
 }
 
 static int image_error(Display *display, XErrorEvent *error) {
+    Host *host = capture_error_host;
+    if (host && error->request_code == host->shm_opcode &&
+        (error->minor_code == X_ShmAttach || error->minor_code == X_ShmGetImage ||
+         error->minor_code == X_ShmDetach)) {
+        /* Shared memory is optional, including when an advertised extension
+         * cannot attach our segment (for example, a different IPC namespace). */
+        host->shm_error = error->error_code;
+        return 0;
+    }
     /* The root can shrink between XGetGeometry and XGetImage. Do not let
      * Xlib's default error handler terminate the host for this race. */
     if (error->request_code == X_GetImage &&
@@ -393,6 +418,41 @@ static int image_error(Display *display, XErrorEvent *error) {
     fprintf(stderr, "X11 capture error: %s (request %u)\n", message, error->request_code);
     stopping = 1;
     return 0;
+}
+
+static void release_shm_image(Host *host) {
+    if (!host->shm_image) return;
+    if (host->shm_attached) {
+        /* Complete previous requests before trapping just our detach request.
+         * Wait for Xorg to release its mapping before releasing ours. */
+        XSync(host->display, False);
+        host->shm_error = 0;
+        capture_error_host = host;
+        XErrorHandler previous_handler = XSetErrorHandler(image_error);
+        XShmDetach(host->display, &host->shm_segment);
+        XSync(host->display, False);
+        XSetErrorHandler(previous_handler);
+        capture_error_host = NULL;
+        host->shm_attached = 0;
+    }
+    host->shm_image->data = NULL; /* The mapping is not malloc-owned image data. */
+    XDestroyImage(host->shm_image);
+    host->shm_image = NULL;
+    if (host->shm_segment.shmaddr && shmdt(host->shm_segment.shmaddr) != 0) {
+        perror("Detaching XShm memory");
+    }
+    if (host->shm_segment.shmid >= 0 && !host->shm_marked &&
+        shmctl(host->shm_segment.shmid, IPC_RMID, NULL) != 0) {
+        perror("Removing XShm segment");
+    }
+    host->shm_segment = (XShmSegmentInfo){.shmid = -1};
+    host->shm_marked = 0;
+}
+
+static void disable_shm(Host *host, const char *reason) {
+    fprintf(stderr, "XShm capture unavailable (%s); using XGetImage until restart\n", reason);
+    host->shm_enabled = 0;
+    release_shm_image(host);
 }
 
 static int capture(Host *host) {
@@ -406,6 +466,10 @@ static int capture(Host *host) {
         return -1;
     }
     int resized = width != (unsigned int)host->width || height != (unsigned int)host->height;
+    if (host->shm_image && (host->shm_image->width != (int)width ||
+        host->shm_image->height != (int)height || host->shm_image->depth != (int)depth)) {
+        release_shm_image(host);
+    }
     /* Check geometry even while idle so the next viewer gets the current size,
      * but avoid reading screen pixels without a viewer unless resizing. */
     if (!resized && !host->client && !host->resize_unavailable) return 0;
@@ -427,14 +491,98 @@ static int capture(Host *host) {
         }
     }
 
-    /* XGetGeometry above has already completed pending X requests. Install the
-     * error handler only around the synchronous image read, not input events. */
-    XErrorHandler previous_handler = XSetErrorHandler(image_error);
-    int64_t grab_started_ns = host->stats.enabled ? monotonic_ns() : 0;
-    XImage *image = XGetImage(host->display, host->root, 0, 0, width, height,
-                             AllPlanes, ZPixmap);
-    uint64_t grab_ns = host->stats.enabled ? (uint64_t)(monotonic_ns() - grab_started_ns) : 0;
-    XSetErrorHandler(previous_handler);
+    if (host->shm_enabled && !host->shm_image) {
+        const char *failure = NULL;
+        char message[160];
+        do {
+            host->shm_segment = (XShmSegmentInfo){.shmid = -1};
+            host->shm_image = XShmCreateImage(host->display,
+                DefaultVisual(host->display, DefaultScreen(host->display)), depth,
+                ZPixmap, NULL, &host->shm_segment, width, height);
+            if (!host->shm_image) {
+                failure = "cannot allocate image metadata";
+                break;
+            }
+            if (host->shm_image->bytes_per_line <= 0 || host->shm_image->height <= 0 ||
+                (size_t)host->shm_image->bytes_per_line > SIZE_MAX / (size_t)host->shm_image->height) {
+                failure = "invalid shared image size";
+                break;
+            }
+            size_t bytes = (size_t)host->shm_image->bytes_per_line * host->shm_image->height;
+            host->shm_segment.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+            if (host->shm_segment.shmid < 0) {
+                snprintf(message, sizeof message, "shmget: %s", strerror(errno));
+                failure = message;
+                break;
+            }
+            char *address = shmat(host->shm_segment.shmid, NULL, 0);
+            if (address == (char *)-1) {
+                snprintf(message, sizeof message, "shmat: %s", strerror(errno));
+                failure = message;
+                break;
+            }
+            host->shm_segment.shmaddr = address;
+            host->shm_image->data = address;
+            host->shm_segment.readOnly = False; /* Xorg must write the capture. */
+            /* Linux allows Xorg to attach after IPC_RMID while our mapping is
+             * alive. Mark early so a crash/disconnect during XShmAttach does
+             * not leave the segment behind. It disappears after both detach. */
+            if (shmctl(host->shm_segment.shmid, IPC_RMID, NULL) != 0) {
+                snprintf(message, sizeof message, "shmctl: %s", strerror(errno));
+                failure = message;
+                break;
+            }
+            host->shm_marked = 1;
+            host->shm_error = 0;
+            capture_error_host = host;
+            XErrorHandler previous_handler = XSetErrorHandler(image_error);
+            Bool attached = XShmAttach(host->display, &host->shm_segment);
+            XSync(host->display, False); /* Attach errors are asynchronous. */
+            XSetErrorHandler(previous_handler);
+            capture_error_host = NULL;
+            if (!attached || host->shm_error) {
+                if (host->shm_error) {
+                    XGetErrorText(host->display, host->shm_error, message, sizeof message);
+                    failure = message;
+                } else {
+                    failure = "XShmAttach failed";
+                }
+                break;
+            }
+            host->shm_attached = 1;
+        } while (0);
+        if (failure) disable_shm(host, failure);
+    }
+
+    /* Geometry has completed pending input requests. Trap errors only around
+     * image operations; never expose optional shared-memory errors to Xlib's
+     * default handler. The reply makes the shared pixels safe to read. */
+    uint64_t grab_ns = 0;
+    XImage *image = NULL;
+    if (host->shm_enabled) {
+        host->shm_error = 0;
+        capture_error_host = host;
+        XErrorHandler previous_handler = XSetErrorHandler(image_error);
+        int64_t grab_started_ns = host->stats.enabled ? monotonic_ns() : 0;
+        Bool captured = XShmGetImage(host->display, host->root, host->shm_image, 0, 0, AllPlanes);
+        if (host->stats.enabled) grab_ns += (uint64_t)(monotonic_ns() - grab_started_ns);
+        XSetErrorHandler(previous_handler);
+        capture_error_host = NULL;
+        if (captured && !host->shm_error) {
+            image = host->shm_image;
+        } else {
+            char message[128] = "XShmGetImage failed";
+            if (host->shm_error) XGetErrorText(host->display, host->shm_error, message, sizeof message);
+            disable_shm(host, message);
+        }
+    }
+    if (!image) {
+        XErrorHandler previous_handler = XSetErrorHandler(image_error);
+        int64_t grab_started_ns = host->stats.enabled ? monotonic_ns() : 0;
+        image = XGetImage(host->display, host->root, 0, 0, width, height, AllPlanes, ZPixmap);
+        if (host->stats.enabled) grab_ns += (uint64_t)(monotonic_ns() - grab_started_ns);
+        XSetErrorHandler(previous_handler);
+    }
     if (!image) {
         if (resized) {
             free(pixels);
@@ -464,7 +612,7 @@ static int capture(Host *host) {
             }
         }
     }
-    XDestroyImage(image);
+    if (image != host->shm_image) XDestroyImage(image);
 
     if (host->client && host->client->enableCursorShapeUpdates && cursor_in_framebuffer(host->client)) {
         rfbCursorPtr cursor = host->screen->cursor;
@@ -605,9 +753,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     host.root = DefaultRootWindow(host.display);
+    host.shm_enabled = XQueryExtension(host.display, "MIT-SHM", &host.shm_opcode, &event_base, &error_base);
+    if (!host.shm_enabled) disable_shm(&host, "MIT-SHM extension is unavailable");
     XFixesSelectCursorInput(host.display, host.root, XFixesDisplayCursorNotifyMask);
     host.cursor_dirty = 1;
     if (capture(&host) != 0) {
+        release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
         XCloseDisplay(host.display);
@@ -619,6 +770,7 @@ int main(int argc, char **argv) {
     host.screen = rfbGetScreen(&vnc_argc, vnc_argv, host.width, host.height, 8, 3, 4);
     if (!host.screen) {
         fprintf(stderr, "Cannot initialize VNC screen\n");
+        release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
         XCloseDisplay(host.display);
@@ -659,6 +811,7 @@ int main(int argc, char **argv) {
     if (!initial_cursor) {
         fprintf(stderr, "Cannot initialize VNC cursor\n");
         rfbScreenCleanup(host.screen);
+        release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
         XCloseDisplay(host.display);
@@ -672,14 +825,16 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
     rfbInitServer(host.screen);
-    if (!rfbIsActive(host.screen)) {
+    if (host.screen->listenSock == RFB_INVALID_SOCKET || !rfbIsActive(host.screen)) {
         fprintf(stderr, "VNC server could not start; check the listen IP and port\n");
         rfbScreenCleanup(host.screen);
+        release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
         XCloseDisplay(host.display);
         return 1;
     }
+    fprintf(stderr, "Capture method: %s\n", host.shm_enabled ? "xshm (shared memory)" : "xgetimage");
     fprintf(stderr, "Serving %dx%d X11 desktop on %s:%d at up to %d fps (Ctrl+C to stop)\n",
             host.width, host.height, listen_ip, port, fps);
     int result = 0;
@@ -729,10 +884,11 @@ int main(int argc, char **argv) {
                 if (host.client && host.client->sock != RFB_INVALID_SOCKET) {
                     viewer = host.client->state == RFB_NORMAL ? "active" : "auth";
                 }
-                fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d captures=%" PRIu64
+                fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d capture=%s captures=%" PRIu64
                         " fps=%.1f capture_ms(avg/max)=%s grab_ms(avg/max)=%s"
                         " vnc_bytes=%" PRIu64 " vnc_KiB/s=%.1f cpu=%s\n",
-                        seconds, viewer, host.width, host.height, stats->captures,
+                        seconds, viewer, host.width, host.height,
+                        host.shm_enabled ? "xshm" : "xgetimage", stats->captures,
                         stats->captures / seconds, capture_ms, grab_ms,
                         stats->sent_bytes, stats->sent_bytes / seconds / 1024.0, cpu);
                 /* Preserve the current client's counter baseline across windows. */
@@ -751,6 +907,7 @@ int main(int argc, char **argv) {
     if (host.client) release_input(&host);
     rfbShutdownServer(host.screen, TRUE);
     rfbScreenCleanup(host.screen);
+    release_shm_image(&host);
     free(host.pixels);
     free(host.next_pixels);
     XCloseDisplay(host.display);

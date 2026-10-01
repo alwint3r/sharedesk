@@ -3,7 +3,7 @@ project(sharedesk_host LANGUAGES C)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VNC REQUIRED IMPORTED_TARGET libvncserver)
-pkg_check_modules(X11_DEPS REQUIRED IMPORTED_TARGET x11 xtst xfixes)
+pkg_check_modules(X11_DEPS REQUIRED IMPORTED_TARGET x11 xtst xfixes xext)
 
 add_executable(sharedesk-host src/host.c)
 target_compile_features(sharedesk-host PRIVATE c_std_11)

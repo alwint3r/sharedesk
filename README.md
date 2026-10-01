@@ -9,7 +9,7 @@ This is an early, polling-based VNC host, not an AnyDesk-compatible client. The 
 Install build dependencies:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libvncserver-dev libx11-dev libxtst-dev libxfixes-dev
+sudo apt install build-essential cmake pkg-config libvncserver-dev libx11-dev libxtst-dev libxfixes-dev libxext-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
@@ -39,6 +39,8 @@ From a terminal **in the logged-in Ubuntu X11 desktop**, run:
 Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. From the Mac, open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. If it cannot bind, check whether another process already uses that port.
 
 The host follows Ubuntu desktop-size changes without restarting. Viewers that support VNC desktop resizing receive the new size and a full repaint. A viewer without resize support is disconnected and can reconnect at the new size; the host keeps listening.
+
+Capture automatically uses the X11 MIT-SHM extension (`xshm`) when available. Xorg and the host share a private image buffer instead of transferring every image through the X11 socket. The buffer is rebuilt after desktop-size changes and released on shutdown. Its SysV shared-memory segment has mode 600 and is marked for automatic removal after both processes detach. If the extension, allocation, attachment or image read fails, the host releases the shared buffer and uses `XGetImage` (`xgetimage`) until restart. No capture-method flag is required; the Mac viewer is unchanged.
 
 Ubuntu's cursor shape, hotspot (the pixel used for clicks) and position are tracked through X11's XFIXES extension and pointer queries. Viewers that support both cursor-shape and cursor-position updates render it locally. For shape-only viewers, the host hides the viewer cursor and draws Ubuntu's cursor into the screen stream instead, including local mouse movement. This fallback updates at `--fps`; try `--fps 30` if cursor motion feels slow. Viewers without cursor-shape support use LibVNCServer's screen-drawn cursor. If the cursor image is temporarily unavailable, the host keeps listening and retries the read.
 
@@ -80,20 +82,21 @@ python3 scripts/install-autostart.py \
   --password-file "$HOME/.sharedesk/vnc-password" --port 5901 --stats
 ```
 
-Restart the host to load the updated launcher. Autostart summaries go to `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set). To disable them, run the installer without `--stats` and restart the host. No new dependencies are needed.
+Restart the host to load the updated launcher. Autostart summaries go to `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set). To disable them, run the installer without `--stats` and restart the host. Enabling statistics needs no additional dependencies beyond those listed in the build instructions.
 
 An example summary with illustrative values:
 
 ```text
-Stats 5.0s: viewer=active size=1920x1080 captures=49 fps=9.8 capture_ms(avg/max)=8.20/12.30 grab_ms(avg/max)=5.10/7.40 vnc_bytes=245760 vnc_KiB/s=48.0 cpu=9.2%
+Stats 5.0s: viewer=active size=1920x1080 capture=xshm captures=49 fps=9.8 capture_ms(avg/max)=8.20/12.30 grab_ms(avg/max)=5.10/7.40 vnc_bytes=245760 vnc_KiB/s=48.0 cpu=9.2%
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `viewer` / `size` | Current connection state (`idle`, `auth`, or `active`) and VNC framebuffer size at reporting time. |
+| `capture` | Selected capture method at reporting time: `xshm` or `xgetimage`. An interval that includes a fallback can contain timings from both methods. |
 | `captures` / `fps` | Successful pixel captures and captures per elapsed second, including unchanged screens. This is not the viewer's displayed frame rate. Startup capture, failed reads and idle geometry checks are excluded. |
 | `capture_ms(avg/max)` | Average and maximum capture-pipeline time in milliseconds, including the X11 read, conversion, cursor composition, tile comparison and resize work. It does not time the normal framebuffer encoding/send step. |
-| `grab_ms(avg/max)` | Average and maximum time inside `XGetImage`, in milliseconds. |
+| `grab_ms(avg/max)` | Average and maximum image-read time in milliseconds (`XShmGetImage` or `XGetImage`). Includes both read attempts if a shared-memory read fails and falls back; excludes buffer setup/cleanup, which is included in `capture_ms`. |
 | `vnc_bytes` / `vnc_KiB/s` | LibVNCServer-accounted bytes and estimated encoded VNC traffic per second (1 KiB = 1024 bytes). Counts continue across reconnects within a reporting interval. |
 | `cpu` | Process user + system CPU time divided by elapsed time; 100% means one CPU core. Includes all host threads, but not Xorg or Tailscale CPU use. |
 
@@ -104,7 +107,7 @@ Traffic is an estimate from the library's counters, not an exact socket or netwo
 ## Current limits
 
 - Desktop size is limited to 8192×8192 pixels. If a running desktop exceeds that limit, or replacement framebuffers cannot be allocated, the host disconnects the viewer and pauses capture. It keeps listening and retries until the desktop can be captured again.
-- While a viewer is connected, polls the full screen and sends changed 64×64 regions; expect more CPU use and less fluid motion than a video-based remote desktop.
+- While a viewer is connected, polls the full screen and sends changed 64×64 regions. Shared memory reduces pixel-transfer overhead, but this is not screen-change detection or video-based streaming; CPU use and motion still depend on capture, encoding and the network.
 - Basic X11 keys, pointer buttons and scrolling. Keyboard mapping depends on the Ubuntu X11 layout; some Mac-specific keys may not map.
 - Standard VNC cursor-shape updates have one-bit transparency, so soft edges are approximate. Screen-drawn cursors preserve alpha blending. Cursor images above 1024×1024 pixels are ignored; cursors too large for LibVNCServer's cursor-update buffer are drawn in the screen stream for shape-capable viewers.
 - One viewer at a time. No audio, clipboard synchronization, file transfer, or login-screen access.
