@@ -2,7 +2,7 @@
 
 A small remote-desktop **host for an already-started Ubuntu X11 session**. It captures the existing desktop and accepts keyboard/mouse input. On the Mac, use the built-in Screen Sharing app as the viewer. No separate server or public inbound port is needed.
 
-This is an early VNC host, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST and XFIXES extensions; Ubuntu's normal Xorg session provides both.
+This is an early VNC host, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
 
 ## Build on Ubuntu 22.04
 
@@ -45,6 +45,8 @@ Capture automatically uses the X11 MIT-SHM extension (`xshm`) when available. Xo
 Screen-change detection automatically uses XDamage when available. It coalesces drawing notifications and captures at up to `--fps`, skipping unchanged screens between notifications. A full safety refresh still runs about once per second while connected, for applications/drivers that omit notifications. Without XDamage, or if tracking fails, the host returns to polling until restart. Connecting a viewer and resizing always request a fresh capture. Cursor position, cursor shape and input processing remain independent; screen-drawn cursor updates use a clean cached image, without requiring a new pixel read.
 
 Ubuntu's cursor shape, hotspot (the pixel used for clicks) and position are tracked through X11's XFIXES extension and pointer queries. Viewers that support both cursor-shape and cursor-position updates render it locally. For shape-only viewers, the host hides the viewer cursor and draws Ubuntu's cursor into the screen stream instead, including local mouse movement. This fallback updates at `--fps`; try `--fps 30` if cursor motion feels slow. Viewers without cursor-shape support use LibVNCServer's screen-drawn cursor. If the cursor image is temporarily unavailable, the host keeps listening and retries the read.
+
+Keyboard input uses the Ubuntu session's XKB map and active layout group. The host selects a key and the Shift/AltGr state needed for the requested character, rather than assuming a physical key position. It temporarily adjusts layout modifiers when needed and restores them; Control, Alt and Super shortcut modifiers remain unchanged. Mapping and repeat-setting changes are tracked through XKB notifications. Ordinary matching keys use native X11 repeat. Characters needing temporary modifier changes use complete taps and a host-driven repeat timer with Ubuntu's configured delay/rate, so they do not repeat under the restored modifier state. Duplicate viewer key-downs do not create a second repeat source. Viewer lock-key events do not toggle Ubuntu's Caps/Num/Scroll Lock settings. The host does not rewrite the server keymap or change its global repeat settings.
 
 Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 10). These set the TCP listening port and the maximum screen-capture rate. When run manually, the host stays in the foreground. Add `--stats` for performance summaries; see below. Ubuntu must remain awake for remote access, but its screen may be locked.
 
@@ -112,7 +114,7 @@ Traffic is an estimate from the library's counters, not an exact socket or netwo
 
 - Desktop size is limited to 8192×8192 pixels. If a running desktop exceeds that limit, or replacement framebuffers cannot be allocated, the host disconnects the viewer and pauses capture. It keeps listening and retries until the desktop can be captured again.
 - Reads full-screen images when needed and sends changed 64×64 regions. XDamage reduces unchanged-screen work, but safety refreshes and the polling fallback still read pixels. This is not video-based streaming; CPU use and motion depend on drawing, capture, encoding and the network.
-- Basic X11 keys, pointer buttons and scrolling. Keyboard mapping depends on the Ubuntu X11 layout; some Mac-specific keys may not map.
+- X11 keys, pointer buttons and scrolling. Keyboard symbols must be available in the active Ubuntu layout group; unsupported symbols are ignored rather than added to the local keymap. Layout-group switching and locked/latched layout modifiers are not synthesized. Some Mac-specific keys may not map. Local and remote input share the X11 keyboard; they are not isolated devices.
 - Standard VNC cursor-shape updates have one-bit transparency, so soft edges are approximate. Screen-drawn cursors preserve alpha blending. Cursor images above 1024×1024 pixels are ignored; cursors too large for LibVNCServer's cursor-update buffer are drawn in the screen stream for shape-capable viewers.
 - One viewer at a time. No audio, clipboard synchronization, file transfer, or login-screen access.
 - Existing X11 session only; after reboot, a user must start a desktop session locally.

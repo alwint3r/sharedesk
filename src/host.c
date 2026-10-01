@@ -2,6 +2,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
+#include <X11/keysym.h>
 #include <X11/Xproto.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
@@ -76,8 +77,21 @@ typedef struct {
     int cursor_dirty;
     int cursor_read_failed;
     int buttons;
+    /* Logical viewer presses: 1 = held in X11, 2 = corrected tap/repeat.
+     * Corrected keys are physically up between taps, so Xorg cannot repeat
+     * them with the restored modifier state. */
     unsigned char keys[256];
-    KeySym key_symbols[256]; /* Viewer symbol recorded at each injected key-down. */
+    KeySym key_symbols[256];
+    KeySym key_aliases[256]; /* Unshifted symbol captured at key-down. */
+    int64_t key_repeat_at[256];
+    XkbDescPtr keymap; /* Host-owned snapshot; never changes the server map. */
+    XkbStateRec keyboard_state;
+    unsigned long keyboard_state_after;
+    unsigned int layout_mods;
+    int keyboard_event_base;
+    int keyboard_state_valid;
+    int keymap_dirty;
+    int keyboard_read_failed;
     Stats stats;
 } Host;
 
@@ -140,12 +154,67 @@ static void display_finished(rfbClientPtr client, int success) {
     sample_client_bytes(client->screen->screenData, client);
 }
 
+static void process_x_events(Host *host);
+
+static int refresh_keyboard(Host *host) {
+    XkbDescPtr map = XkbGetMap(host->display, XkbAllMapComponentsMask, XkbUseCoreKbd);
+    XkbStateRec state;
+    if (!map || XkbGetControls(host->display, XkbAllControlsMask, map) != Success ||
+        XkbGetState(host->display, XkbUseCoreKbd, &state) != Success) {
+        if (map) XkbFreeKeyboard(map, XkbAllComponentsMask, True);
+        if (!host->keyboard_read_failed) fprintf(stderr, "Cannot read XKB keyboard map\n");
+        host->keyboard_read_failed = 1;
+        return -1;
+    }
+    unsigned int layout = ShiftMask, shortcuts = ControlMask | LockMask;
+    for (int code = map->min_key_code; code <= map->max_key_code; ++code) {
+        unsigned int mods = map->map->modmap[code];
+        for (int i = 0; mods && i < XkbKeyNumSyms(map, code); ++i) {
+            KeySym symbol = XkbKeySymsPtr(map, code)[i];
+            if (symbol == XK_ISO_Level3_Shift) layout |= mods;
+            if (symbol == XK_Control_L || symbol == XK_Control_R ||
+                symbol == XK_Alt_L || symbol == XK_Alt_R ||
+                symbol == XK_Meta_L || symbol == XK_Meta_R ||
+                symbol == XK_Super_L || symbol == XK_Super_R ||
+                symbol == XK_Hyper_L || symbol == XK_Hyper_R) shortcuts |= mods;
+        }
+    }
+    if (host->keymap) XkbFreeKeyboard(host->keymap, XkbAllComponentsMask, True);
+    host->keymap = map;
+    host->layout_mods = layout & ~shortcuts;
+    host->keyboard_state = state;
+    host->keyboard_state_after = LastKnownRequestProcessed(host->display);
+    host->keyboard_state_valid = 1;
+    host->keymap_dirty = 0;
+    host->keyboard_read_failed = 0;
+    return 0;
+}
+
+static int inject_key(Host *host, KeyCode code, Bool down) {
+    if (host->keymap && (code < host->keymap->min_key_code || code > host->keymap->max_key_code)) return -1;
+    unsigned long serial = NextRequest(host->display);
+    if (!XTestFakeKeyEvent(host->display, code, down, CurrentTime)) return -1;
+    /* Notifications from before this request cannot describe its result. */
+    if (host->keymap && XkbKeyHasActions(host->keymap, code)) {
+        for (int i = 0; i < XkbKeyNumActions(host->keymap, code); ++i) {
+            if (XkbKeyActionsPtr(host->keymap, code)[i].any.type != XkbSA_NoAction) {
+                host->keyboard_state_valid = 0;
+                host->keyboard_state_after = serial;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
 static void release_input(Host *host) {
     for (int key = 1; key < 256; ++key) {
         if (host->keys[key]) {
-            XTestFakeKeyEvent(host->display, (KeyCode)key, False, CurrentTime);
+            if (host->keys[key] == 1) inject_key(host, (KeyCode)key, False);
             host->keys[key] = 0;
             host->key_symbols[key] = NoSymbol;
+            host->key_aliases[key] = NoSymbol;
+            host->key_repeat_at[key] = 0;
         }
     }
     for (int button = 1; button <= 3; ++button) {
@@ -192,9 +261,146 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
     return RFB_CLIENT_ACCEPT;
 }
 
+/* New presses and corrected-key repeats share translation and injection.
+ * A nonzero code pins a repeat to its original binding. */
+static int press_key(Host *host, KeySym symbol, KeyCode repeat_code) {
+    process_x_events(host);
+    if (host->keymap_dirty && refresh_keyboard(host) != 0) return -1;
+    if (!host->keyboard_state_valid) {
+        if (XkbGetState(host->display, XkbUseCoreKbd, &host->keyboard_state) != Success) return -1;
+        host->keyboard_state_after = LastKnownRequestProcessed(host->display);
+        host->keyboard_state_valid = 1;
+    }
+    KeyCode code = 0;
+    unsigned int wanted = 0, current = 0;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        current = host->keyboard_state.mods;
+        unsigned int editable = host->layout_mods &
+            ~(host->keyboard_state.locked_mods | host->keyboard_state.latched_mods);
+        int best = INT_MAX;
+        code = 0;
+        for (int key = host->keymap->min_key_code; key <= host->keymap->max_key_code; ++key) {
+            if (repeat_code ? key != repeat_code : host->keys[key] != 0) continue;
+            /* Function/navigation/modifier keys are physical shortcut keys,
+             * not text. Preserve their modifiers even when XKB gives the
+             * combination another name (e.g. Ctrl+Alt+F1). */
+            if ((IsModifierKey(symbol) || (symbol >= 0xff00 && symbol <= 0xffff)) &&
+                !IsKeypadKey(symbol)) {
+                for (int i = 0; i < XkbKeyNumSyms(host->keymap, key); ++i) {
+                    if (XkbKeySymsPtr(host->keymap, key)[i] == symbol) {
+                        code = (KeyCode)key;
+                        wanted = current;
+                        best = 0;
+                        break;
+                    }
+                }
+                if (best == 0) break;
+                continue;
+            }
+            for (unsigned int variation = 0; variation <= editable; ++variation) {
+                if (variation & ~editable) continue;
+                unsigned int mods = (current & ~editable) | variation;
+                int score = 0;
+                for (unsigned int bits = mods ^ current; bits; bits >>= 1) score += bits & 1;
+                if (score >= best) continue;
+                KeySym produced;
+                unsigned int consumed;
+                if (XkbTranslateKeyCode(host->keymap, (KeyCode)key,
+                    XkbBuildCoreState(mods, host->keyboard_state.group), &consumed, &produced) &&
+                    produced == symbol) {
+                    code = (KeyCode)key;
+                    wanted = mods;
+                    best = score;
+                }
+            }
+            if (best == 0) break;
+        }
+        if (!code) return -1; /* Never inject a different symbol or rewrite the keymap. */
+        if (wanted == current || attempt == 1) break;
+        /* Synchronize before temporary changes. Matching ordinary keys use
+         * the cached map/state without a round trip. */
+        if (XkbGetState(host->display, XkbUseCoreKbd, &host->keyboard_state) != Success) return -1;
+        host->keyboard_state_after = LastKnownRequestProcessed(host->display);
+        host->keyboard_state_valid = 1;
+    }
+    XkbControlsPtr controls = host->keymap->ctrls;
+    int can_repeat = (controls->enabled_ctrls & XkbRepeatKeysMask) &&
+                    ((controls->per_key_repeat[code / 8] >> (code % 8)) & 1);
+    if (repeat_code && !can_repeat) {
+        host->key_repeat_at[code] = 0;
+        return 0;
+    }
+    signed char changes[256] = {0};
+    if (wanted != current || repeat_code) {
+        char physical[32];
+        XQueryKeymap(host->display, physical);
+        if (((unsigned char)physical[code / 8] >> (code % 8)) & 1) return -1;
+        unsigned int off = current & ~wanted, on = wanted & ~current, covered = 0;
+        for (int key = host->keymap->min_key_code; key <= host->keymap->max_key_code; ++key) {
+            unsigned int mods = host->keymap->map->modmap[key];
+            if ((mods & off) && (((unsigned char)physical[key / 8] >> (key % 8)) & 1)) {
+                if (mods & ~host->layout_mods) return -1;
+                changes[key] = -1;
+                covered |= mods;
+            }
+        }
+        if (off & ~covered) return -1;
+        for (int key = host->keymap->min_key_code; key <= host->keymap->max_key_code; ++key) {
+            unsigned int mods = host->keymap->map->modmap[key];
+            if (mods && !(mods & ~on) && (mods & on)) {
+                changes[key] = 1;
+                on &= ~mods;
+            }
+        }
+        if (on) return -1;
+    }
+    int tapped = repeat_code || wanted != current;
+    int ready = 1;
+    for (int key = 1; key < 256; ++key) {
+        if (changes[key] < 0 && inject_key(host, (KeyCode)key, False) != 0) ready = 0;
+    }
+    for (int key = 1; key < 256; ++key) {
+        if (changes[key] > 0 && inject_key(host, (KeyCode)key, True) != 0) ready = 0;
+    }
+    int sent = ready && inject_key(host, code, True) == 0;
+    int held = sent;
+    if (sent && tapped) {
+        if (inject_key(host, code, False) == 0 || inject_key(host, code, False) == 0) held = 0;
+    }
+    /* Always undo attempted modifier changes, including on injection failure. */
+    for (int key = 255; key > 0; --key) if (changes[key] > 0) inject_key(host, (KeyCode)key, False);
+    for (int key = 255; key > 0; --key) if (changes[key] < 0) inject_key(host, (KeyCode)key, True);
+    if (!sent) {
+        XFlush(host->display);
+        return -1;
+    }
+    if (!repeat_code) {
+        host->keys[code] = held ? 1 : 2;
+        host->key_symbols[code] = symbol;
+        KeySym alias;
+        unsigned int consumed;
+        unsigned int base = current & ~(host->layout_mods | LockMask);
+        host->key_aliases[code] = XkbTranslateKeyCode(host->keymap, code,
+            XkbBuildCoreState(base, host->keyboard_state.group), &consumed, &alias) ? alias : NoSymbol;
+    }
+    if (repeat_code && held) host->keys[code] = 1; /* Release hook owns a failed tap-up. */
+    if (tapped && !held && can_repeat) {
+        unsigned int delay = repeat_code ? controls->repeat_interval : controls->repeat_delay;
+        host->key_repeat_at[code] = monotonic_ns() + (int64_t)(delay ? delay : 1) * 1000000;
+    } else {
+        host->key_repeat_at[code] = 0;
+    }
+    XFlush(host->display);
+    return 0;
+}
+
 static void keyboard_event(rfbBool down, rfbKeySym symbol, rfbClientPtr client) {
     Host *host = client->screen->screenData;
     if (client != host->client) return;
+    /* Keysyms carry case/number intent. Viewer locks must not toggle the
+     * existing desktop's Caps/Num/Scroll Lock settings. */
+    if (symbol == XK_Caps_Lock || symbol == XK_Shift_Lock ||
+        symbol == XK_Num_Lock || symbol == XK_Scroll_Lock) return;
     KeyCode code = 0;
     for (int key = 1; key < 256; ++key) {
         if (host->keys[key] && host->key_symbols[key] == (KeySym)symbol) {
@@ -202,40 +408,30 @@ static void keyboard_event(rfbBool down, rfbKeySym symbol, rfbClientPtr client) 
             break;
         }
     }
-    /* Prefer the recorded key for a matching release. Also accept an
-     * unshifted key-up symbol, e.g. 'A' down then 'a' up after releasing Shift,
-     * through the original lookup instead of leaving the key held. */
+    if (down) {
+        /* Native repeat or our corrected-tap timer owns repeats, never both. */
+        if (!code) (void)press_key(host, (KeySym)symbol, 0);
+        return;
+    }
     if (!code) {
-        code = XKeysymToKeycode(host->display, (KeySym)symbol);
-        /* Keep ordinary keys on the original path, without a synchronous
-         * state query. Only angle brackets need modifier-aware selection. */
-        if (down && (symbol == '<' || symbol == '>')) {
-            XkbStateRec state;
-            if (XkbGetState(host->display, XkbUseCoreKbd, &state) == Success) {
-                unsigned int modifiers = XkbBuildCoreState(state.mods, state.group);
-                unsigned int consumed;
-                KeySym produced;
-                int minimum, maximum;
-                XDisplayKeycodes(host->display, &minimum, &maximum);
-                /* Prefer the first key that produces the requested bracket;
-                 * with Shift held, US comma/period precede the ISO '< >' key. */
-                for (int key = minimum; key <= maximum; ++key) {
-                    if (XkbLookupKeySym(host->display, (KeyCode)key, modifiers, &consumed, &produced) &&
-                        produced == (KeySym)symbol) {
-                        code = (KeyCode)key;
-                        break;
-                    }
-                }
+        for (int key = 1; key < 256; ++key) {
+            if (!host->keys[key]) continue;
+            KeySym lower, upper;
+            XConvertCase(host->key_symbols[key], &lower, &upper);
+            if (host->key_aliases[key] == (KeySym)symbol ||
+                lower == (KeySym)symbol || upper == (KeySym)symbol) {
+                if (code) return; /* Do not guess between unrelated held keys. */
+                code = (KeyCode)key;
             }
         }
     }
-    if (code == 0) return; /* No key in the current X11 keyboard layout. */
-    if (host->keys[code] != (unsigned char)(down != 0)) {
-        XTestFakeKeyEvent(host->display, code, down ? True : False, CurrentTime);
-        host->keys[code] = (unsigned char)(down != 0);
-        host->key_symbols[code] = down ? (KeySym)symbol : NoSymbol;
-        XFlush(host->display);
-    }
+    if (!code) return;
+    if (host->keys[code] == 1) inject_key(host, code, False);
+    host->keys[code] = 0;
+    host->key_symbols[code] = NoSymbol;
+    host->key_aliases[code] = NoSymbol;
+    host->key_repeat_at[code] = 0;
+    XFlush(host->display);
 }
 
 static void pointer_event(int mask, int x, int y, rfbClientPtr client) {
@@ -353,8 +549,23 @@ static void process_x_events(Host *host) {
         } else if (host->damage && event.type == host->damage_event_base + XDamageNotify &&
                    ((XDamageNotifyEvent *)&event)->damage == host->damage) {
             host->screen_dirty = 1;
+        } else if (event.type == host->keyboard_event_base + XkbEventCode) {
+            XkbEvent *keyboard = (XkbEvent *)&event;
+            if (keyboard->any.xkb_type == XkbStateNotify &&
+                keyboard->any.serial >= host->keyboard_state_after) {
+                host->keyboard_state.mods = (unsigned char)keyboard->state.mods;
+                host->keyboard_state.group = (unsigned char)keyboard->state.group;
+                host->keyboard_state.locked_mods = (unsigned char)keyboard->state.locked_mods;
+                host->keyboard_state.latched_mods = (unsigned char)keyboard->state.latched_mods;
+                host->keyboard_state_valid = 1;
+            } else if (keyboard->any.xkb_type == XkbMapNotify ||
+                       keyboard->any.xkb_type == XkbNewKeyboardNotify ||
+                       keyboard->any.xkb_type == XkbControlsNotify) {
+                host->keymap_dirty = 1;
+            }
         } else if (event.type == MappingNotify) {
             XRefreshKeyboardMapping(&event.xmapping);
+            if (event.xmapping.request != MappingPointer) host->keymap_dirty = 1;
         }
     }
 }
@@ -887,6 +1098,23 @@ int main(int argc, char **argv) {
         XCloseDisplay(host.display);
         return 1;
     }
+    major = XkbMajorVersion;
+    minor = XkbMinorVersion;
+    int keyboard_opcode;
+    if (!XkbQueryExtension(host.display, &keyboard_opcode, &host.keyboard_event_base,
+                          &error_base, &major, &minor)) {
+        fprintf(stderr, "X11 XKEYBOARD input extension is unavailable\n");
+        XCloseDisplay(host.display);
+        return 1;
+    }
+    unsigned int keyboard_events = XkbStateNotifyMask | XkbMapNotifyMask |
+                                  XkbNewKeyboardNotifyMask | XkbControlsNotifyMask;
+    XkbSelectEvents(host.display, XkbUseCoreKbd, keyboard_events, keyboard_events);
+    host.keymap_dirty = 1;
+    if (refresh_keyboard(&host) != 0) {
+        XCloseDisplay(host.display);
+        return 1;
+    }
     host.root = DefaultRootWindow(host.display);
     host.shm_enabled = XQueryExtension(host.display, "MIT-SHM", &host.shm_opcode, &event_base, &error_base);
     if (!host.shm_enabled) disable_shm(&host, "MIT-SHM extension is unavailable");
@@ -916,6 +1144,7 @@ int main(int argc, char **argv) {
         free(host.pixels);
         free(host.next_pixels);
         free(host.raw_pixels);
+        XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -930,6 +1159,7 @@ int main(int argc, char **argv) {
         free(host.pixels);
         free(host.next_pixels);
         free(host.raw_pixels);
+        XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -973,6 +1203,7 @@ int main(int argc, char **argv) {
         free(host.pixels);
         free(host.next_pixels);
         free(host.raw_pixels);
+        XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -992,6 +1223,7 @@ int main(int argc, char **argv) {
         free(host.pixels);
         free(host.next_pixels);
         free(host.raw_pixels);
+        XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -1015,6 +1247,13 @@ int main(int argc, char **argv) {
          * retain the previous cursor until the next shape notification. */
         (void)update_cursor(&host);
         int64_t current = monotonic_ns();
+        for (int key = 1; key < 256; ++key) {
+            if (host.keys[key] == 2 && host.key_repeat_at[key] && current >= host.key_repeat_at[key]) {
+                if (press_key(&host, host.key_symbols[key], (KeyCode)key) != 0) {
+                    host.key_repeat_at[key] = current + 50000000; /* Bounded retry. */
+                }
+            }
+        }
         if (current >= next_capture) {
             if (capture(&host) != 0) {
                 result = 1;
@@ -1061,8 +1300,13 @@ int main(int argc, char **argv) {
             }
         }
         /* Capture and reporting may have consumed part or all of the interval.
-         * Wait only for the time remaining until the next capture deadline. */
-        int64_t wait_us = (next_capture - monotonic_ns()) / 1000;
+         * Wait only until the next capture or corrected-key repeat deadline. */
+        int64_t deadline = next_capture;
+        for (int key = 1; key < 256; ++key) {
+            if (host.keys[key] == 2 && host.key_repeat_at[key] && host.key_repeat_at[key] < deadline)
+                deadline = host.key_repeat_at[key];
+        }
+        int64_t wait_us = (deadline - monotonic_ns()) / 1000;
         if (wait_us > 50000) wait_us = 50000;
         if (wait_us < 1000) wait_us = 1000;
         rfbProcessEvents(host.screen, (long)wait_us);
@@ -1075,6 +1319,7 @@ int main(int argc, char **argv) {
     free(host.pixels);
     free(host.next_pixels);
     free(host.raw_pixels);
+    XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
     XCloseDisplay(host.display);
     memset(password, 0, sizeof password);
     return result;
