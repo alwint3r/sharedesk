@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/Xproto.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
@@ -76,6 +77,7 @@ typedef struct {
     int cursor_read_failed;
     int buttons;
     unsigned char keys[256];
+    KeySym key_symbols[256]; /* Viewer symbol recorded at each injected key-down. */
     Stats stats;
 } Host;
 
@@ -143,6 +145,7 @@ static void release_input(Host *host) {
         if (host->keys[key]) {
             XTestFakeKeyEvent(host->display, (KeyCode)key, False, CurrentTime);
             host->keys[key] = 0;
+            host->key_symbols[key] = NoSymbol;
         }
     }
     for (int button = 1; button <= 3; ++button) {
@@ -192,11 +195,45 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
 static void keyboard_event(rfbBool down, rfbKeySym symbol, rfbClientPtr client) {
     Host *host = client->screen->screenData;
     if (client != host->client) return;
-    KeyCode code = XKeysymToKeycode(host->display, (KeySym)symbol);
+    KeyCode code = 0;
+    for (int key = 1; key < 256; ++key) {
+        if (host->keys[key] && host->key_symbols[key] == (KeySym)symbol) {
+            code = (KeyCode)key;
+            break;
+        }
+    }
+    /* Release the key selected at key-down, not a new lookup: the viewer may
+     * have released Shift or changed the keyboard group in the meantime. */
+    if (!down && !code) return;
+    if (down && !code) {
+        code = XKeysymToKeycode(host->display, (KeySym)symbol);
+        XkbStateRec state;
+        if (XkbGetState(host->display, XkbUseCoreKbd, &state) == Success) {
+            unsigned int modifiers = XkbBuildCoreState(state.mods, state.group);
+            unsigned int consumed;
+            KeySym produced;
+            /* A symbol can exist on several keys. With Shift held, the first
+             * '<' key may produce '>'; prefer a key that actually produces
+             * the requested symbol in the active XKB group and modifiers. */
+            if (!code || !XkbLookupKeySym(host->display, code, modifiers, &consumed, &produced) ||
+                produced != (KeySym)symbol) {
+                int minimum, maximum;
+                XDisplayKeycodes(host->display, &minimum, &maximum);
+                for (int key = minimum; key <= maximum; ++key) {
+                    if (XkbLookupKeySym(host->display, (KeyCode)key, modifiers, &consumed, &produced) &&
+                        produced == (KeySym)symbol) {
+                        code = (KeyCode)key;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if (code == 0) return; /* No key in the current X11 keyboard layout. */
     if (host->keys[code] != (unsigned char)(down != 0)) {
         XTestFakeKeyEvent(host->display, code, down ? True : False, CurrentTime);
         host->keys[code] = (unsigned char)(down != 0);
+        host->key_symbols[code] = down ? (KeySym)symbol : NoSymbol;
         XFlush(host->display);
     }
 }
