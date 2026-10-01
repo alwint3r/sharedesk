@@ -5,6 +5,7 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/Xdamage.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/shmproto.h>
 #include <arpa/inet.h>
@@ -29,6 +30,7 @@ typedef struct {
     int64_t started_ns;
     int64_t cpu_started_us;
     uint64_t captures;
+    uint64_t cursor_frames;
     uint64_t capture_ns;
     uint64_t capture_max_ns;
     uint64_t grab_ns;
@@ -45,8 +47,17 @@ typedef struct {
     Window root;
     rfbScreenInfoPtr screen;
     rfbClientPtr client;
-    uint32_t *pixels;
-    uint32_t *next_pixels;
+    uint32_t *pixels;      /* Viewer output, borrowed by LibVNCServer. */
+    uint32_t *next_pixels; /* Working framebuffer, including a painted cursor. */
+    uint32_t *raw_pixels;  /* Last successful clean RGB capture, owned by host. */
+    Damage damage;
+    int damage_opcode;
+    int damage_event_base;
+    int damage_error;
+    int screen_dirty;
+    int64_t last_pixel_capture_ns;
+    int cursor_repaint;
+    int cursor_composited;
     /* Persistent raw capture storage, never borrowed by LibVNCServer. The
      * image metadata and SysV mapping belong to this host; Xorg writes only
      * during the synchronous XShmGetImage call. */
@@ -95,9 +106,13 @@ static int64_t process_cpu_us(void) {
            (int64_t)usage.ru_stime.tv_sec * 1000000 + usage.ru_stime.tv_usec;
 }
 
-static void record_capture(Host *host, int64_t started_ns, uint64_t grab_ns) {
+static void record_capture(Host *host, int64_t started_ns, uint64_t grab_ns, int read_pixels) {
     Stats *stats = &host->stats;
     if (!stats->enabled) return;
+    if (!read_pixels) {
+        ++stats->cursor_frames;
+        return;
+    }
     uint64_t elapsed = (uint64_t)(monotonic_ns() - started_ns);
     ++stats->captures;
     stats->capture_ns += elapsed;
@@ -145,6 +160,11 @@ static void client_gone(rfbClientPtr client) {
         /* The library frees the client's statistics after this callback. */
         sample_client_bytes(host, client);
         release_input(host);
+        if (host->cursor_composited) {
+            memcpy(host->pixels, host->raw_pixels, (size_t)host->width * host->height * 4);
+            host->cursor_composited = 0;
+            host->cursor_repaint = 1;
+        }
         host->client = NULL;
         fprintf(stderr, "Viewer disconnected\n");
     }
@@ -161,6 +181,8 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
         return RFB_CLIENT_REFUSE;
     }
     host->client = client;
+    host->screen_dirty = 1; /* Refresh a snapshot that may have aged while idle. */
+    host->cursor_repaint = 1;
     if (host->stats.enabled) host->stats.last_sent_bytes = 0;
     client->clientGoneHook = client_gone;
     fprintf(stderr, "Viewer connected; waiting for VNC authentication\n");
@@ -203,6 +225,7 @@ static void pointer_event(int mask, int x, int y, rfbClientPtr client) {
         }
     }
     host->buttons = mask & 0x7f;
+    if (x != host->screen->cursorX || y != host->screen->cursorY) host->cursor_repaint = 1;
     rfbDefaultPtrAddEvent(mask, x, y, client);
     XFlush(host->display);
 }
@@ -284,17 +307,23 @@ static rfbCursorPtr viewer_cursor(rfbClientPtr client) {
     return cursor_in_framebuffer(client) ? NULL : client->screen->cursor;
 }
 
-static int update_cursor(Host *host) {
+static void process_x_events(Host *host) {
     while (XPending(host->display)) {
         XEvent event;
         XNextEvent(host->display, &event);
         if (event.type == host->cursor_event_base + XFixesCursorNotify) {
             host->cursor_dirty = 1;
+        } else if (host->damage && event.type == host->damage_event_base + XDamageNotify &&
+                   ((XDamageNotifyEvent *)&event)->damage == host->damage) {
+            host->screen_dirty = 1;
         } else if (event.type == MappingNotify) {
             XRefreshKeyboardMapping(&event.xmapping);
         }
     }
+}
 
+static int update_cursor(Host *host) {
+    process_x_events(host);
     int result = 0;
     if (host->cursor_dirty) {
         host->cursor_dirty = 0;
@@ -361,6 +390,7 @@ static int update_cursor(Host *host) {
                     /* Ownership transfers to LibVNCServer, which frees this
                      * cursor on replacement and during screen cleanup. */
                     rfbSetCursor(host->screen, cursor);
+                    host->cursor_repaint = 1;
                 }
             }
             XFree(image);
@@ -379,6 +409,7 @@ static int update_cursor(Host *host) {
         if (x != host->screen->cursorX || y != host->screen->cursorY) {
             host->screen->cursorX = x;
             host->screen->cursorY = y;
+            host->cursor_repaint = 1;
             if (host->client) host->client->cursorWasMoved = TRUE;
         }
     }
@@ -401,6 +432,12 @@ static int pause_for_resize(Host *host, unsigned int width, unsigned int height,
 
 static int image_error(Display *display, XErrorEvent *error) {
     Host *host = capture_error_host;
+    if (host && error->request_code == host->damage_opcode &&
+        (error->minor_code == X_DamageQueryVersion || error->minor_code == X_DamageCreate ||
+         error->minor_code == X_DamageSubtract || error->minor_code == X_DamageDestroy)) {
+        host->damage_error = error->error_code;
+        return 0;
+    }
     if (host && error->request_code == host->shm_opcode &&
         (error->minor_code == X_ShmAttach || error->minor_code == X_ShmGetImage ||
          error->minor_code == X_ShmDetach)) {
@@ -418,6 +455,20 @@ static int image_error(Display *display, XErrorEvent *error) {
     fprintf(stderr, "X11 capture error: %s (request %u)\n", message, error->request_code);
     stopping = 1;
     return 0;
+}
+
+static void release_damage(Host *host) {
+    if (!host->damage) return;
+    XSync(host->display, False);
+    host->damage_error = 0;
+    capture_error_host = host;
+    XErrorHandler previous_handler = XSetErrorHandler(image_error);
+    XDamageDestroy(host->display, host->damage);
+    XSync(host->display, False);
+    XSetErrorHandler(previous_handler);
+    capture_error_host = NULL;
+    host->damage = None;
+    host->screen_dirty = 1;
 }
 
 static void release_shm_image(Host *host) {
@@ -456,7 +507,8 @@ static void disable_shm(Host *host, const char *reason) {
 }
 
 static int capture(Host *host) {
-    int64_t started_ns = host->stats.enabled ? monotonic_ns() : 0;
+    int64_t current_ns = (host->stats.enabled || host->damage) ? monotonic_ns() : 0;
+    int64_t started_ns = host->stats.enabled ? current_ns : 0;
     Window unused_root;
     int x, y;
     unsigned int width, height, border, depth;
@@ -469,13 +521,26 @@ static int capture(Host *host) {
     if (host->shm_image && (host->shm_image->width != (int)width ||
         host->shm_image->height != (int)height || host->shm_image->depth != (int)depth)) {
         release_shm_image(host);
+        host->screen_dirty = 1;
     }
     /* Check geometry even while idle so the next viewer gets the current size,
      * but avoid reading screen pixels without a viewer unless resizing. */
     if (!resized && !host->client && !host->resize_unavailable) return 0;
 
+    /* Geometry is synchronous: collect notifications it brought in before
+     * deciding to reuse the cache. Refresh at least once a second as a safety
+     * measure for applications/drivers that omit damage notifications. */
+    process_x_events(host);
+    int read_pixels = resized || host->resize_unavailable || !host->damage ||
+                      host->screen_dirty || current_ns - host->last_pixel_capture_ns >= 1000000000LL;
+    int paint_cursor = host->client && host->client->enableCursorShapeUpdates &&
+                       cursor_in_framebuffer(host->client);
+    if (!read_pixels && paint_cursor == host->cursor_composited &&
+        (!paint_cursor || !host->cursor_repaint)) return 0;
+
     uint32_t *pixels = host->pixels;
     uint32_t *next_pixels = host->next_pixels;
+    uint32_t *raw_pixels = host->raw_pixels;
     if (resized) {
         if (width < 1 || height < 1 || width > 8192 || height > 8192 ||
             (size_t)width * height > INT_MAX / 4) {
@@ -484,10 +549,33 @@ static int capture(Host *host) {
         size_t bytes = (size_t)width * height * 4;
         pixels = malloc(bytes);
         next_pixels = malloc(bytes);
-        if (!pixels || !next_pixels) {
+        raw_pixels = malloc(bytes);
+        if (!pixels || !next_pixels || !raw_pixels) {
             free(pixels);
             free(next_pixels);
+            free(raw_pixels);
             return pause_for_resize(host, width, height, "cannot allocate replacement framebuffers");
+        }
+    }
+
+    uint64_t grab_ns = 0;
+    if (!read_pixels) goto compose_frame;
+    if (host->damage) {
+        /* Clear BEFORE reading, never after: drawing concurrent with capture
+         * must leave the tracker armed for a later snapshot. */
+        host->screen_dirty = 0;
+        host->damage_error = 0;
+        capture_error_host = host;
+        XErrorHandler previous_handler = XSetErrorHandler(image_error);
+        XDamageSubtract(host->display, host->damage, None, None);
+        XSync(host->display, False);
+        XSetErrorHandler(previous_handler);
+        capture_error_host = NULL;
+        if (host->damage_error) {
+            char message[128];
+            XGetErrorText(host->display, host->damage_error, message, sizeof message);
+            fprintf(stderr, "XDamage tracking failed (%s); using polling until restart\n", message);
+            release_damage(host);
         }
     }
 
@@ -557,7 +645,6 @@ static int capture(Host *host) {
     /* Geometry has completed pending input requests. Trap errors only around
      * image operations; never expose optional shared-memory errors to Xlib's
      * default handler. The reply makes the shared pixels safe to read. */
-    uint64_t grab_ns = 0;
     XImage *image = NULL;
     if (host->shm_enabled) {
         host->shm_error = 0;
@@ -584,9 +671,11 @@ static int capture(Host *host) {
         XSetErrorHandler(previous_handler);
     }
     if (!image) {
+        host->screen_dirty = 1; /* A failed read must not consume the change. */
         if (resized) {
             free(pixels);
             free(next_pixels);
+            free(raw_pixels);
         }
         /* On a running host, retry with fresh geometry on the next capture. */
         if (host->screen && !stopping) return 0;
@@ -598,14 +687,14 @@ static int capture(Host *host) {
         image->red_mask == 0x00ff0000 && image->green_mask == 0x0000ff00 &&
         image->blue_mask == 0x000000ff) {
         for (unsigned int row = 0; row < height; ++row) {
-            memcpy(next_pixels + (size_t)row * width,
+            memcpy(raw_pixels + (size_t)row * width,
                    image->data + (size_t)row * image->bytes_per_line, width * 4);
         }
     } else {
         for (unsigned int row = 0; row < height; ++row) {
             for (unsigned int col = 0; col < width; ++col) {
                 unsigned long pixel = XGetPixel(image, col, row);
-                next_pixels[(size_t)row * width + col] =
+                raw_pixels[(size_t)row * width + col] =
                     (channel(pixel, image->red_mask) << 16) |
                     (channel(pixel, image->green_mask) << 8) |
                     channel(pixel, image->blue_mask);
@@ -613,8 +702,13 @@ static int capture(Host *host) {
         }
     }
     if (image != host->shm_image) XDestroyImage(image);
+    if (host->damage) host->last_pixel_capture_ns = monotonic_ns();
 
-    if (host->client && host->client->enableCursorShapeUpdates && cursor_in_framebuffer(host->client)) {
+compose_frame:
+    /* Keep a clean cache for both capture methods. Painting into it would
+     * leave cursor trails when the screen itself has not changed. */
+    memcpy(next_pixels, raw_pixels, (size_t)width * height * 4);
+    if (paint_cursor) {
         rfbCursorPtr cursor = host->screen->cursor;
         int left = host->screen->cursorX - cursor->xhot;
         int top = host->screen->cursorY - cursor->yhot;
@@ -622,8 +716,8 @@ static int capture(Host *host) {
         int start_y = top < 0 ? -top : 0;
         int end_x = left + cursor->width > (int)width ? (int)width - left : cursor->width;
         int end_y = top + cursor->height > (int)height ? (int)height - top : cursor->height;
-        /* Compose onto the fresh capture, not the previous frame, so moving or
-         * changing the cursor restores its old background without a trail. */
+        /* Compose onto clean pixels, including on cursor-only cached frames,
+         * so moving or changing the cursor restores its old background. */
         for (int row = start_y; row < end_y; ++row) {
             for (int col = start_x; col < end_x; ++col) {
                 size_t offset = (size_t)row * cursor->width + col;
@@ -644,6 +738,8 @@ static int capture(Host *host) {
         }
     }
 
+    host->cursor_composited = paint_cursor;
+    host->cursor_repaint = 0;
     if (host->resize_unavailable) {
         fprintf(stderr, "Desktop capture resumed\n");
         host->resize_unavailable = 0;
@@ -667,11 +763,13 @@ static int capture(Host *host) {
         }
         free(host->pixels);
         free(host->next_pixels);
+        free(host->raw_pixels);
         host->pixels = pixels;
         host->next_pixels = next_pixels;
+        host->raw_pixels = raw_pixels;
         host->width = (int)width;
         host->height = (int)height;
-        record_capture(host, started_ns, grab_ns);
+        record_capture(host, started_ns, grab_ns, read_pixels);
         return 0;
     }
     /* Compare tiles to avoid sending the entire screen for a small change. */
@@ -697,7 +795,7 @@ static int capture(Host *host) {
             }
         }
     }
-    record_capture(host, started_ns, grab_ns);
+    record_capture(host, started_ns, grab_ns, read_pixels);
     return 0;
 }
 
@@ -755,12 +853,32 @@ int main(int argc, char **argv) {
     host.root = DefaultRootWindow(host.display);
     host.shm_enabled = XQueryExtension(host.display, "MIT-SHM", &host.shm_opcode, &event_base, &error_base);
     if (!host.shm_enabled) disable_shm(&host, "MIT-SHM extension is unavailable");
+    host.screen_dirty = 1;
+    if (XQueryExtension(host.display, "DAMAGE", &host.damage_opcode, &host.damage_event_base, &error_base)) {
+        host.damage_error = 0;
+        capture_error_host = &host;
+        XErrorHandler previous_handler = XSetErrorHandler(image_error);
+        major = DAMAGE_MAJOR;
+        minor = DAMAGE_MINOR;
+        Damage candidate = None;
+        if (XDamageQueryVersion(host.display, &major, &minor) && major == DAMAGE_MAJOR &&
+            !host.damage_error) {
+            candidate = XDamageCreate(host.display, host.root, XDamageReportNonEmpty);
+            XSync(host.display, False);
+        }
+        XSetErrorHandler(previous_handler);
+        capture_error_host = NULL;
+        if (candidate && !host.damage_error) host.damage = candidate;
+    }
+    if (!host.damage) fprintf(stderr, "XDamage unavailable; using polling until restart\n");
     XFixesSelectCursorInput(host.display, host.root, XFixesDisplayCursorNotifyMask);
     host.cursor_dirty = 1;
     if (capture(&host) != 0) {
+        release_damage(&host);
         release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
+        free(host.raw_pixels);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -770,9 +888,11 @@ int main(int argc, char **argv) {
     host.screen = rfbGetScreen(&vnc_argc, vnc_argv, host.width, host.height, 8, 3, 4);
     if (!host.screen) {
         fprintf(stderr, "Cannot initialize VNC screen\n");
+        release_damage(&host);
         release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
+        free(host.raw_pixels);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -811,9 +931,11 @@ int main(int argc, char **argv) {
     if (!initial_cursor) {
         fprintf(stderr, "Cannot initialize VNC cursor\n");
         rfbScreenCleanup(host.screen);
+        release_damage(&host);
         release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
+        free(host.raw_pixels);
         XCloseDisplay(host.display);
         return 1;
     }
@@ -828,13 +950,17 @@ int main(int argc, char **argv) {
     if (host.screen->listenSock == RFB_INVALID_SOCKET || !rfbIsActive(host.screen)) {
         fprintf(stderr, "VNC server could not start; check the listen IP and port\n");
         rfbScreenCleanup(host.screen);
+        release_damage(&host);
         release_shm_image(&host);
         free(host.pixels);
         free(host.next_pixels);
+        free(host.raw_pixels);
         XCloseDisplay(host.display);
         return 1;
     }
-    fprintf(stderr, "Capture method: %s\n", host.shm_enabled ? "xshm (shared memory)" : "xgetimage");
+    fprintf(stderr, "Capture method: %s; changes: %s\n",
+            host.shm_enabled ? "xshm (shared memory)" : "xgetimage",
+            host.damage ? "xdamage (with 1-second safety refresh)" : "polling");
     fprintf(stderr, "Serving %dx%d X11 desktop on %s:%d at up to %d fps (Ctrl+C to stop)\n",
             host.width, host.height, listen_ip, port, fps);
     int result = 0;
@@ -884,12 +1010,12 @@ int main(int argc, char **argv) {
                 if (host.client && host.client->sock != RFB_INVALID_SOCKET) {
                     viewer = host.client->state == RFB_NORMAL ? "active" : "auth";
                 }
-                fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d capture=%s captures=%" PRIu64
-                        " fps=%.1f capture_ms(avg/max)=%s grab_ms(avg/max)=%s"
+                fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d capture=%s changes=%s captures=%" PRIu64
+                        " fps=%.1f cursor_frames=%" PRIu64 " capture_ms(avg/max)=%s grab_ms(avg/max)=%s"
                         " vnc_bytes=%" PRIu64 " vnc_KiB/s=%.1f cpu=%s\n",
                         seconds, viewer, host.width, host.height,
-                        host.shm_enabled ? "xshm" : "xgetimage", stats->captures,
-                        stats->captures / seconds, capture_ms, grab_ms,
+                        host.shm_enabled ? "xshm" : "xgetimage", host.damage ? "xdamage" : "poll",
+                        stats->captures, stats->captures / seconds, stats->cursor_frames, capture_ms, grab_ms,
                         stats->sent_bytes, stats->sent_bytes / seconds / 1024.0, cpu);
                 /* Preserve the current client's counter baseline across windows. */
                 *stats = (Stats){.enabled = 1, .started_ns = report_ns,
@@ -907,9 +1033,11 @@ int main(int argc, char **argv) {
     if (host.client) release_input(&host);
     rfbShutdownServer(host.screen, TRUE);
     rfbScreenCleanup(host.screen);
+    release_damage(&host);
     release_shm_image(&host);
     free(host.pixels);
     free(host.next_pixels);
+    free(host.raw_pixels);
     XCloseDisplay(host.display);
     memset(password, 0, sizeof password);
     return result;
