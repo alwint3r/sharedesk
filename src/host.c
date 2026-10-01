@@ -202,23 +202,23 @@ static void keyboard_event(rfbBool down, rfbKeySym symbol, rfbClientPtr client) 
             break;
         }
     }
-    /* Release the key selected at key-down, not a new lookup: the viewer may
-     * have released Shift or changed the keyboard group in the meantime. */
-    if (!down && !code) return;
-    if (down && !code) {
+    /* Prefer the recorded key for a matching release. Also accept an
+     * unshifted key-up symbol, e.g. 'A' down then 'a' up after releasing Shift,
+     * through the original lookup instead of leaving the key held. */
+    if (!code) {
         code = XKeysymToKeycode(host->display, (KeySym)symbol);
-        XkbStateRec state;
-        if (XkbGetState(host->display, XkbUseCoreKbd, &state) == Success) {
-            unsigned int modifiers = XkbBuildCoreState(state.mods, state.group);
-            unsigned int consumed;
-            KeySym produced;
-            /* A symbol can exist on several keys. With Shift held, the first
-             * '<' key may produce '>'; prefer a key that actually produces
-             * the requested symbol in the active XKB group and modifiers. */
-            if (!code || !XkbLookupKeySym(host->display, code, modifiers, &consumed, &produced) ||
-                produced != (KeySym)symbol) {
+        /* Keep ordinary keys on the original path, without a synchronous
+         * state query. Only angle brackets need modifier-aware selection. */
+        if (down && (symbol == '<' || symbol == '>')) {
+            XkbStateRec state;
+            if (XkbGetState(host->display, XkbUseCoreKbd, &state) == Success) {
+                unsigned int modifiers = XkbBuildCoreState(state.mods, state.group);
+                unsigned int consumed;
+                KeySym produced;
                 int minimum, maximum;
                 XDisplayKeycodes(host->display, &minimum, &maximum);
+                /* Prefer the first key that produces the requested bracket;
+                 * with Shift held, US comma/period precede the ISO '< >' key. */
                 for (int key = minimum; key <= maximum; ++key) {
                     if (XkbLookupKeySym(host->display, (KeyCode)key, modifiers, &consumed, &produced) &&
                         produced == (KeySym)symbol) {
