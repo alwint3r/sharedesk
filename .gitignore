@@ -1,5 +1,6 @@
 # CMake build directories and generated files
 /build/
+/build-mac/
 /out/
 /cmake-build-*/
 CMakeFiles/

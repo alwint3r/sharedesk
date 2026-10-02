@@ -1,8 +1,25 @@
 # Sharedesk
 
-A small remote-desktop **host for an already-started Ubuntu X11 session**. It captures the existing desktop and accepts keyboard/mouse input. On the Mac, use the built-in Screen Sharing app as the viewer. No separate server or public inbound port is needed.
+A small private remote-desktop application: an **Ubuntu X11 host** and a **native Mac viewer**. The host captures an already-started desktop and accepts keyboard/mouse input. The viewer uses standard VNC, including opt-in two-way text clipboard sharing. Screen Sharing remains an alternative for desktop access, but its clipboard interoperability has not been established. No relay server or public inbound port is needed.
 
-This is an early VNC host, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
+This is an early VNC application, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
+
+## Repository layout
+
+```text
+CMakeLists.txt                 # Root build entry point and platform selection
+README.md                     # Shared build and usage documentation
+host/
+  CMakeLists.txt               # Host target and dependencies
+  host.c
+  scripts/install-autostart.py
+viewer/
+  CMakeLists.txt               # Viewer target and dependencies
+  viewer.m
+  viewer-Info.plist.in
+```
+
+Run the commands below from the repository root. The application folders own their files and build definitions; they are not standalone CMake projects. Build outputs remain at `build/sharedesk-host` on Ubuntu and `build-mac/sharedesk-viewer.app` on the Mac.
 
 ## Build on Ubuntu 22.04
 
@@ -15,6 +32,31 @@ cmake --build build
 ```
 
 Build from this directory on Ubuntu, inside or outside the desktop session. The same C source also builds for Linux x86-64 and ARM64 with the corresponding Linux libraries; it is not a macOS host.
+
+## Build the Mac viewer
+
+On the Mac, install LibVNCClient through Homebrew's `libvncserver` package. Xcode or its Command Line Tools must provide the macOS SDK:
+
+```sh
+brew install cmake pkg-config libvncserver
+cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release
+cmake --build build-mac
+open build-mac/sharedesk-viewer.app
+```
+
+CMake builds the viewer on macOS and the host on Linux. The viewer uses Objective-C for native AppKit integration and LibVNCClient for the VNC protocol. This development app requires the Homebrew libraries on the Mac where it runs; it is not yet a standalone distribution bundle.
+
+Disconnect Screen Sharing first; the host accepts one viewer at a time. Enter Ubuntu's **numeric Tailscale IPv4**, port **5901**, and the same VNC password as the host, then click **Connect**. The viewer also allows loopback IPv4 for local connections. DNS names, public addresses, unauthenticated servers, and IPv6 are not supported. Passwords are cleared from the field when connecting and are not saved. Re-enter the password to reconnect; reconnects are manual.
+
+The viewer uses elapsed-time deadlines: three seconds for TCP connection setup, five seconds per authentication/initialization operation, and twenty seconds per incoming VNC message or outgoing input/clipboard packet. An unchanged desktop has no idle timeout. **Disconnect** cancels pending network I/O. These application deadlines replace LibVNCClient 0.9.15's retry-count timeout, which can reject healthy fragmented transfers too early. Already-buffered messages are processed without waiting for further network traffic.
+
+The desktop scales to fit the window. Host resolution changes replace the framebuffer without reconnecting. Mouse clicks, dragging, horizontal/vertical scrolling and cursor shapes are supported. Ubuntu cursor-position messages do not move the Mac's global pointer.
+
+Keyboard input initially targets English (US) direct keys, including Shift punctuation, navigation, F1–F12 and shortcuts. **Control maps to Ubuntu Ctrl, Option to Alt, and Command to Super**, not Ctrl. Cmd+Q and Cmd+W stay local. Key-up uses the remembered key-down symbol; Mac repeat events are ignored because the host owns repeat. Losing focus releases held input. IME composition and dead-key text entry are not supported yet.
+
+For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard (Latin-1)** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
+
+Clipboard sharing is off by default in both programs. The viewer rejects unrepresentable Unicode, NUL-containing text and text over 1 MiB without shortening it. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
 
 ## Connect from the Mac
 
@@ -36,7 +78,7 @@ From a terminal **in the logged-in Ubuntu X11 desktop**, run:
   --password-file "$HOME/.sharedesk/vnc-password" --port 5901
 ```
 
-Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. From the Mac, open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. If it cannot bind, check whether another process already uses that port.
+Port 5901 lets the existing `x11vnc` server keep port 5900 during comparison. Connect with the [Sharedesk viewer](#build-the-mac-viewer), or open `vnc://<Ubuntu Tailscale IPv4>:5901` using Screen Sharing and enter the new VNC password. After comparison, stop `x11vnc` and remove any access-policy rule for its port. Stop this host with Ctrl+C; it releases any input held by the viewer. If it cannot bind, check whether another process already uses that port.
 
 The host follows Ubuntu desktop-size changes without restarting. Viewers that support VNC desktop resizing receive the new size and a full repaint. A viewer without resize support is disconnected and can reconnect at the new size; the host keeps listening.
 
@@ -55,7 +97,7 @@ Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 
 After the manual connection works, install per-user graphical-session autostart **on Ubuntu** (not on the Mac). Use the same password file and port that worked manually:
 
 ```sh
-python3 scripts/install-autostart.py --password-file "$HOME/.sharedesk/vnc-password" --port 5901
+python3 host/scripts/install-autostart.py --password-file "$HOME/.sharedesk/vnc-password" --port 5901
 ```
 
 Do not use `sudo`. The installer copies the current build to `~/.local/libexec/sharedesk/` and creates `~/.config/autostart/sharedesk-host.desktop`. The desktop entry stays under `.config/autostart` because the graphical session looks there; the VNC password remains in `~/.sharedesk`. The installer waits for a Tailscale IPv4 address, then starts the host in the logged-in **X11** session. It does not log in at boot, restart a failed host, or keep the session awake. After rebuilding, run the installer again to copy the new executable.
@@ -65,7 +107,7 @@ Stop your manually started host with Ctrl+C before checking autostart at the **n
 To disable autostart and remove its installed executable:
 
 ```sh
-python3 scripts/install-autostart.py --remove
+python3 host/scripts/install-autostart.py --remove
 ```
 
 This does not stop a host that is already running, and it leaves the password file and logs intact. Use `pgrep -a sharedesk-host` to find a running host and `kill <PID>` to stop it if needed.
@@ -83,12 +125,12 @@ Clipboard sharing is **off by default**. Add `--clipboard` to enable two-way tex
 To enable it in the installed autostart copy:
 
 ```sh
-python3 scripts/install-autostart.py \
+python3 host/scripts/install-autostart.py \
   --password-file "$HOME/.sharedesk/vnc-password" \
   --port 5901 --fps 30 --stats --clipboard
 ```
 
-Restart the running host, or log out and back in locally, to load the new executable and options. The installer does not restart an existing process. This host uses standard VNC text messages, not Apple's private clipboard extensions. Clipboard interoperability with macOS Screen Sharing is not established; enabling **Edit → Use Shared Clipboard** does not prove that standard messages are being sent.
+Restart the running host, or log out and back in locally, to load the new executable and options. The installer does not restart an existing process. This host uses standard VNC text messages, not Apple's private clipboard extensions. Use the Sharedesk viewer's clipboard checkbox to send and receive these standard messages. Clipboard interoperability with macOS Screen Sharing is not established; enabling **Edit → Use Shared Clipboard** does not prove that standard messages are being sent.
 
 Only Ubuntu's **CLIPBOARD** selection (normal Copy/Paste) is shared. Selecting text for middle-click paste (**PRIMARY**) is not shared. The host does not send an existing Ubuntu clipboard snapshot when a viewer connects; it exports new clipboard changes while authenticated. Imported viewer text remains available to Ubuntu applications after disconnect, until another application takes ownership or the host stops. Pending exports and the per-connection echo cache are cleared on disconnect.
 
@@ -110,7 +152,7 @@ Statistics are off by default. Add `--stats` to print one summary to stderr ever
 For autostart, enable the same option when updating its installed copy:
 
 ```sh
-python3 scripts/install-autostart.py \
+python3 host/scripts/install-autostart.py \
   --password-file "$HOME/.sharedesk/vnc-password" --port 5901 --stats
 ```
 

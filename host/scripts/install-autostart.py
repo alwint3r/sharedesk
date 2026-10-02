@@ -25,7 +25,7 @@ def atomic_write(path: Path, contents: bytes, mode: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--password-file", type=Path, help="existing private VNC password file")
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parent.parent / "build/sharedesk-host")
+    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[2] / "build/sharedesk-host")
     parser.add_argument("--port", type=int, default=5901)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--stats", action="store_true", help="enable performance summaries every five seconds")
