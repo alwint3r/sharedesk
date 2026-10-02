@@ -23,6 +23,8 @@ viewer/
   VNCBridge.h
   module.modulemap            # Swift import of the C bridge
   viewer-Info.plist.in
+  sharedesk-viewer.icns        # Packaged macOS app icon
+  make-icon.swift             # Editable icon artwork and size generation
 ```
 
 Run the commands below from the repository root. The application folders own their files and build definitions; they are not standalone CMake projects. Build outputs remain at `build/sharedesk-host` on Ubuntu and `build-mac/sharedesk-viewer.app` on the Mac.
@@ -67,6 +69,20 @@ Keyboard input initially targets English (US) direct keys, including Shift punct
 For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard (Latin-1)** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
 
 Clipboard sharing is off by default in both programs. The viewer rejects unrepresentable Unicode, NUL-containing text and text over 1 MiB without shortening it. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
+
+### Regenerate the viewer icon
+
+The build packages `viewer/sharedesk-viewer.icns` for Finder and the Dock. Its artwork is defined in `viewer/make-icon.swift`; normal builds do not run the artwork generator. To regenerate the icon on macOS after editing that script:
+
+```sh
+icon_tmp=$(mktemp -d /tmp/sharedesk-icon.XXXXXX)
+swift viewer/make-icon.swift "$icon_tmp/Sharedesk.iconset"
+iconutil -c icns "$icon_tmp/Sharedesk.iconset" -o viewer/sharedesk-viewer.icns
+rm -r "$icon_tmp"
+cmake --build build-mac
+```
+
+The icon includes standard 1x and 2x representations from 16 to 1024 pixels, with simplified small-size geometry. Quit and reopen the viewer when convenient to load an updated icon; rebuilding does not restart a running connection. Finder or the Dock may retain a cached icon temporarily.
 
 ## Connect from the Mac
 
