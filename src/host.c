@@ -40,6 +40,9 @@ typedef struct {
     uint64_t grab_max_ns;
     uint64_t sent_bytes;
     uint32_t last_sent_bytes;
+    uint64_t clipboard_received;
+    uint64_t clipboard_imports;
+    uint64_t clipboard_sent;
 } Stats;
 
 #define CLIPBOARD_LIMIT (1U << 20) /* Standard LibVNCServer cut-text limit. */
@@ -214,8 +217,11 @@ static void reset_clipboard_connection(Host *host) {
 static void clipboard_from_viewer(char *text, int length, rfbClientPtr client) {
     Host *host = client->screen->screenData;
     Clipboard *clip = &host->clipboard;
-    if (!clip->enabled || client != host->client || client->state != RFB_NORMAL ||
-        client->sock == RFB_INVALID_SOCKET || length < 0 || (unsigned int)length > CLIPBOARD_LIMIT ||
+    if (client != host->client || client->state != RFB_NORMAL || client->sock == RFB_INVALID_SOCKET) return;
+    /* Count authenticated standard messages even when clipboard sharing is
+     * off. This distinguishes viewer silence from a disabled/rejecting host. */
+    if (host->stats.enabled) ++host->stats.clipboard_received;
+    if (!clip->enabled || length < 0 || (unsigned int)length > CLIPBOARD_LIMIT ||
         (length && memchr(text, '\0', (size_t)length))) return;
     if (!clip->active) {
         process_x_events(host); /* Discard selection changes from before authentication. */
@@ -241,6 +247,7 @@ static void clipboard_from_viewer(char *text, int length, rfbClientPtr client) {
     clip->owned_at = CurrentTime;
     clip->owned_after = NextRequest(host->display);
     XSetSelectionOwner(host->display, clip->selection, clip->window, CurrentTime);
+    if (host->stats.enabled) ++host->stats.clipboard_imports;
     XFlush(host->display);
 }
 
@@ -439,6 +446,7 @@ static void clipboard_event(Host *host, XEvent *event) {
              * viewer's wait; the existing capture/input loop owns all work. */
             int previous_wait = host->screen->maxClientWait;
             host->screen->maxClientWait = 1000;
+            if (host->stats.enabled) ++host->stats.clipboard_sent;
             rfbSendServerCutText(host->screen, wire, (int)count);
             host->screen->maxClientWait = previous_wait;
         }
@@ -1613,11 +1621,14 @@ int main(int argc, char **argv) {
                 }
                 fprintf(stderr, "Stats %.1fs: viewer=%s size=%dx%d capture=%s changes=%s captures=%" PRIu64
                         " fps=%.1f cursor_frames=%" PRIu64 " capture_ms(avg/max)=%s grab_ms(avg/max)=%s"
-                        " vnc_bytes=%" PRIu64 " vnc_KiB/s=%.1f cpu=%s\n",
+                        " vnc_bytes=%" PRIu64 " vnc_KiB/s=%.1f cpu=%s"
+                        " clipboard=%s clip_rx=%" PRIu64 " clip_imports=%" PRIu64 " clip_tx=%" PRIu64 "\n",
                         seconds, viewer, host.width, host.height,
                         host.shm_enabled ? "xshm" : "xgetimage", host.damage ? "xdamage" : "poll",
                         stats->captures, stats->captures / seconds, stats->cursor_frames, capture_ms, grab_ms,
-                        stats->sent_bytes, stats->sent_bytes / seconds / 1024.0, cpu);
+                        stats->sent_bytes, stats->sent_bytes / seconds / 1024.0, cpu,
+                        host.clipboard.enabled ? "on" : "off", stats->clipboard_received,
+                        stats->clipboard_imports, stats->clipboard_sent);
                 /* Preserve the current client's counter baseline across windows. */
                 *stats = (Stats){.enabled = 1, .started_ns = report_ns,
                                  .cpu_started_us = cpu_now_us,

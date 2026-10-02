@@ -88,13 +88,15 @@ python3 scripts/install-autostart.py \
   --port 5901 --fps 30 --stats --clipboard
 ```
 
-Restart the running host, or log out and back in locally, to load the new executable and options. The installer does not restart an existing process. If Screen Sharing offers **Edit → Use Shared Clipboard**, enable it. Clipboard controls depend on the viewer; this host uses standard VNC text messages.
+Restart the running host, or log out and back in locally, to load the new executable and options. The installer does not restart an existing process. This host uses standard VNC text messages, not Apple's private clipboard extensions. Clipboard interoperability with macOS Screen Sharing is not established; enabling **Edit → Use Shared Clipboard** does not prove that standard messages are being sent.
 
 Only Ubuntu's **CLIPBOARD** selection (normal Copy/Paste) is shared. Selecting text for middle-click paste (**PRIMARY**) is not shared. The host does not send an existing Ubuntu clipboard snapshot when a viewer connects; it exports new clipboard changes while authenticated. Imported viewer text remains available to Ubuntu applications after disconnect, until another application takes ownership or the host stops. Pending exports and the per-connection echo cache are cleared on disconnect.
 
 **Privacy:** enabled clipboard sharing is automatic and can transfer passwords or other sensitive text. Sharedesk keeps its clipboard buffers in memory and does not write their contents to logs or files. Other applications or clipboard managers may store shared text. To disable sharing, reinstall without `--clipboard` and restart the host. Preserve your other options, such as `--fps 30 --stats`.
 
 Ubuntu 22.04's standard VNC clipboard protocol uses **Latin-1**, not full Unicode. ASCII, multiline text and Latin-1 characters such as `é` and `£` are supported, up to **1 MiB** of VNC text. X11 UTF-8 text is converted only when it fits Latin-1. Other Unicode text, embedded NUL bytes and oversized Ubuntu copies are ignored rather than corrupted or shortened. LibVNCServer disconnects a viewer that sends a clipboard message larger than 1 MiB; the listener remains available for reconnection. Images, files and formatted clipboard data are not transferred. Large incremental X11 reads are bounded and time out after two seconds; an unavailable clipboard owner does not stop desktop sharing.
+
+For missing clipboard transfers, `--stats` reports the running host's `clipboard=on/off` setting plus content-free counters. During the five-second window containing a Mac copy, `clip_rx=0` means no authenticated standard clipboard message reached the host callback. A positive `clip_rx` with `clip_imports=0` means the message was received but not accepted for import (for example, sharing is off or the text was rejected). Positive `clip_imports` counts accepted X11 ownership requests, not confirmation that a particular application pasted the text. In Ubuntu Terminal, paste with **Ctrl+Shift+V** or right-click → **Paste**, not macOS Cmd+V.
 
 ## Performance statistics
 
@@ -117,7 +119,7 @@ Restart the host to load the updated launcher. Autostart summaries go to `~/.loc
 An example summary with illustrative values:
 
 ```text
-Stats 5.0s: viewer=active size=1920x1080 capture=xshm changes=xdamage captures=49 fps=9.8 cursor_frames=12 capture_ms(avg/max)=8.20/12.30 grab_ms(avg/max)=5.10/7.40 vnc_bytes=245760 vnc_KiB/s=48.0 cpu=9.2%
+Stats 5.0s: viewer=active size=1920x1080 capture=xshm changes=xdamage captures=49 fps=9.8 cursor_frames=12 capture_ms(avg/max)=8.20/12.30 grab_ms(avg/max)=5.10/7.40 vnc_bytes=245760 vnc_KiB/s=48.0 cpu=9.2% clipboard=off clip_rx=0 clip_imports=0 clip_tx=0
 ```
 
 | Field | Meaning |
@@ -131,6 +133,8 @@ Stats 5.0s: viewer=active size=1920x1080 capture=xshm changes=xdamage captures=4
 | `grab_ms(avg/max)` | Average and maximum image-read time in milliseconds (`XShmGetImage` or `XGetImage`). Includes both read attempts if a shared-memory read fails and falls back; excludes buffer setup/cleanup, which is included in `capture_ms`. |
 | `vnc_bytes` / `vnc_KiB/s` | LibVNCServer-accounted bytes and estimated encoded VNC traffic per second (1 KiB = 1024 bytes). Counts continue across reconnects within a reporting interval. |
 | `cpu` | Process user + system CPU time divided by elapsed time; 100% means one CPU core. Includes all host threads, but not Xorg or Tailscale CPU use. |
+| `clipboard` | Runtime text clipboard setting: `on` or `off`. |
+| `clip_rx` / `clip_imports` / `clip_tx` | Authenticated standard clipboard messages received / accepted imports / outgoing send attempts during this reporting interval. These count messages, not contents or successful pastes. |
 
 Capture times average only frames that read pixels; cursor-only work is included in CPU use, not those averages. Capture times show `n/a` when no pixels were captured; CPU shows `n/a` if process CPU accounting is unavailable. Each summary covers the actual elapsed interval, including any time before connecting or after disconnecting. An idle resize can still cause a capture. A blocked event loop can delay a summary beyond five seconds.
 
