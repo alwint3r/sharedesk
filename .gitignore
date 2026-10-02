@@ -1,6 +1,7 @@
 # CMake build directories and generated files
 /build/
 /build-mac/
+/build-mac-objectivec/
 /out/
 /cmake-build-*/
 CMakeFiles/

@@ -1,0 +1,4 @@
+module SharedeskVNC {
+    header "VNCBridge.h"
+    export *
+}

@@ -15,7 +15,13 @@ host/
   scripts/install-autostart.py
 viewer/
   CMakeLists.txt               # Viewer target and dependencies
-  viewer.m
+  main.swift                  # Application entry point
+  ViewerApplication.swift     # Window, controls and main-thread clipboard
+  DesktopView.swift           # Rendering, cursor and input
+  VNCSession.swift            # Worker, session state, queues and deadlines
+  VNCBridge.c                 # LibVNCClient callbacks and buffer ownership
+  VNCBridge.h
+  module.modulemap            # Swift import of the C bridge
   viewer-Info.plist.in
 ```
 
@@ -35,16 +41,20 @@ Build from this directory on Ubuntu, inside or outside the desktop session. The 
 
 ## Build the Mac viewer
 
-On the Mac, install LibVNCClient through Homebrew's `libvncserver` package. Xcode or its Command Line Tools must provide the macOS SDK:
+On the Mac, install LibVNCClient through Homebrew's `libvncserver` package. Xcode or its Command Line Tools must provide a Swift 6 or newer compiler and the macOS SDK. Use Ninja for the Swift build:
 
 ```sh
-brew install cmake pkg-config libvncserver
-cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release
+brew install cmake ninja pkg-config libvncserver
+cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-mac
 open build-mac/sharedesk-viewer.app
 ```
 
-CMake builds the viewer on macOS and the host on Linux. The viewer uses Objective-C for native AppKit integration and LibVNCClient for the VNC protocol. This development app requires the Homebrew libraries on the Mac where it runs; it is not yet a standalone distribution bundle.
+**Upgrading an existing build:** CMake cannot change an existing build directory from Unix Makefiles to Ninja. Before configuring, move the old `build-mac` directory to an unused backup path, such as `build-mac-objectivec`, then run the commands above. Keep the working app and its source revision until normal use with the Swift viewer confirms the migration. Quit the Swift viewer before opening the fallback app at `build-mac-objectivec/sharedesk-viewer.app`.
+
+CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer. This development app requires the Homebrew libraries on the Mac where it runs; it is not yet a standalone distribution bundle.
+
+One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
 
 Disconnect Screen Sharing first; the host accepts one viewer at a time. Enter Ubuntu's **numeric Tailscale IPv4**, port **5901**, and the same VNC password as the host, then click **Connect**. The viewer also allows loopback IPv4 for local connections. DNS names, public addresses, unauthenticated servers, and IPv6 are not supported. Passwords are cleared from the field when connecting and are not saved. Re-enter the password to reconnect; reconnects are manual.
 
