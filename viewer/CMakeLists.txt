@@ -26,3 +26,24 @@ set_target_properties(sharedesk-viewer PROPERTIES
     MACOSX_BUNDLE_BUNDLE_VERSION 1
     MACOSX_BUNDLE_SHORT_VERSION_STRING 0.1
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/viewer-Info.plist.in")
+
+# Only installation/packaging embeds libraries and signs the copied bundle.
+# Ordinary builds keep the existing development app and output path.
+install(DIRECTORY "$<TARGET_BUNDLE_DIR:sharedesk-viewer>/"
+    DESTINATION Sharedesk.app USE_SOURCE_PERMISSIONS
+    PATTERN "*.d" EXCLUDE)
+install(FILES Install.txt DESTINATION .)
+configure_file(package-app.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/package-app.cmake" @ONLY)
+install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/package-app.cmake")
+
+set(CPACK_GENERATOR DragNDrop)
+set(CPACK_PACKAGE_NAME Sharedesk)
+set(CPACK_PACKAGE_VERSION 0.1)
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Private remote-desktop viewer")
+set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CPACK_PACKAGE_FILE_NAME "Sharedesk-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_DMG_VOLUME_NAME Sharedesk)
+set(CPACK_DMG_FORMAT UDZO)
+set(CPACK_DMG_DISABLE_APPLICATIONS_SYMLINK OFF)
+set(CPACK_SOURCE_GENERATOR "")
+include(CPack)

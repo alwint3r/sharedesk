@@ -1,0 +1,39 @@
+Sharedesk — private Mac installer
+
+Requirements
+  Apple Silicon Mac running macOS 27 or newer.
+  Tailscale access to your already-started Ubuntu X11 desktop.
+  No Homebrew libraries are needed on the destination Mac.
+
+Install
+  1. Quit an existing Sharedesk viewer when convenient.
+  2. Drag Sharedesk.app onto the Applications shortcut.
+  3. Eject the disk image and open Sharedesk from Applications.
+
+This private build has an ad-hoc signature, not an Apple Developer ID signature
+or Apple notarization. If macOS blocks a copy you know and trust, try opening it,
+then use System Settings > Privacy & Security > Open Anyway and confirm.
+Do not disable Gatekeeper globally. This package is not a public release.
+
+Connect
+  Select a saved profile or enter the Ubuntu device's numeric Tailscale IPv4,
+  VNC port and password, then click Connect. The host accepts one viewer at a
+  time, so disconnect Screen Sharing or another viewer first.
+
+Existing data
+  Installation does not include, replace or remove your saved profiles.
+  They stay in ~/.sharedesk/profiles.json. Optional saved passwords stay in
+  macOS Keychain. macOS may ask for renewed Keychain access for this build.
+  The app never connects automatically or saves a password in the profile file.
+
+Update / remove
+  Quit Sharedesk before replacing it with a new copy in Applications.
+  To uninstall, quit it and move Sharedesk.app from Applications to the Trash.
+  Profiles and Keychain items remain unless you remove them separately.
+
+Third-party licenses
+  In Finder, use Show Package Contents on Sharedesk.app and open
+  Contents/Resources/ThirdPartyNotices.txt and Contents/Resources/Licenses.
+  This software is based in part on the work of the Independent JPEG Group.
+  LibVNCClient uses GPL-2.0-or-later. This installer is for private use; review
+  licensing and corresponding-source obligations before redistributing it.

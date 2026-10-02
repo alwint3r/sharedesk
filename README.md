@@ -28,6 +28,8 @@ viewer/
   viewer-Info.plist.in
   sharedesk-viewer.icns        # Packaged macOS app icon
   make-icon.swift             # Editable icon artwork and size generation
+  package-app.cmake.in        # Installed-bundle dependencies, notices and signing
+  Install.txt                 # Instructions included in the private DMG
 ```
 
 Run the commands below from the repository root. The application folders own their files and build definitions; they are not standalone CMake projects. Build outputs remain at `build/sharedesk-host` on Ubuntu and `build-mac/sharedesk-viewer.app` on the Mac.
@@ -44,6 +46,32 @@ cmake --build build
 
 Build from this directory on Ubuntu, inside or outside the desktop session. The same C source also builds for Linux x86-64 and ARM64 with the corresponding Linux libraries; it is not a macOS host.
 
+## Install the Mac viewer
+
+The private installer is **`build-mac/Sharedesk-0.1-arm64.dmg`**. It contains a self-contained **Sharedesk.app** for **Apple Silicon and macOS 27 or newer**. The destination Mac does not need Homebrew, Xcode or the repository. It still needs Tailscale access to the Ubuntu host.
+
+```sh
+open build-mac/Sharedesk-0.1-arm64.dmg
+```
+
+Quit an existing viewer when convenient, drag **Sharedesk.app** onto the **Applications** shortcut, eject the disk image, then open Sharedesk from Applications. Installation does not change the Ubuntu host, `~/.sharedesk/profiles.json`, or saved Keychain passwords. macOS may request renewed Keychain access for the installed build.
+
+**This is an ad-hoc signed private build, not an Apple-notarized public release.** If macOS blocks a copy you know and trust, try opening it, then use **System Settings → Privacy & Security → Open Anyway** and confirm. Do not disable Gatekeeper globally. Intel and older macOS versions are not supported by this package; the bundled Homebrew libraries require macOS 27.
+
+To update, quit Sharedesk before replacing its copy in Applications. To uninstall, quit it and move the app to the Trash. Profiles and Keychain items remain unless removed separately.
+
+### Create the private installer
+
+After configuring the Mac build as below, run from the repository root:
+
+```sh
+cmake --build build-mac --target package
+```
+
+This builds the viewer, stages it as `Sharedesk.app`, embeds LibVNCClient and its non-system library dependencies (including OpenSSL's dynamically loaded legacy provider for VNC authentication), collects their license notices, verifies deployment targets and bundle dependencies, signs the libraries and completed app, and creates the DMG. It does not install into Applications or restart a viewer. A packaging failure stops the command rather than publishing a partially prepared app.
+
+The ordinary `build-mac/sharedesk-viewer.app` remains a development bundle. Packaging changes only a staged copy; macOS supplies the system frameworks and Swift runtime. Third-party notices are in the installed app's `Contents/Resources/ThirdPartyNotices.txt` and `Contents/Resources/Licenses`. LibVNCClient uses GPL-2.0-or-later; review licensing and corresponding-source requirements before redistributing this private package.
+
 ## Build the Mac viewer
 
 On the Mac, install LibVNCClient through Homebrew's `libvncserver` package. Xcode or its Command Line Tools must provide a Swift 6 or newer compiler and the macOS SDK. Use Ninja for the Swift build:
@@ -57,7 +85,7 @@ open build-mac/sharedesk-viewer.app
 
 **Upgrading an existing build:** CMake cannot change an existing build directory from Unix Makefiles to Ninja. Before configuring, move the old `build-mac` directory to an unused backup path, such as `build-mac-objectivec`, then run the commands above. Keep the working app and its source revision until normal use with the Swift viewer confirms the migration. Quit the Swift viewer before opening the fallback app at `build-mac-objectivec/sharedesk-viewer.app`.
 
-CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer. This development app requires the Homebrew libraries on the Mac where it runs; it is not yet a standalone distribution bundle.
+CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer. The ordinary development app requires the Homebrew libraries on the Mac where it runs. Use the [private installer](#install-the-mac-viewer) for a self-contained copy.
 
 One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
 

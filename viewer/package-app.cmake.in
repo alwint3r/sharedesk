@@ -1,0 +1,115 @@
+# Run only on the installed copy, including CPack's private staging directory.
+# Never modify the development bundle or the machine's Homebrew libraries.
+set(app "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/Sharedesk.app")
+set(executable "${app}/Contents/MacOS/sharedesk-viewer")
+set(licenses "${app}/Contents/Resources/Licenses")
+set(search_dirs "@VNC_CLIENT_LIBRARY_DIRS@")
+include(BundleUtilities)
+get_bundle_main_executable("${app}" bundle_executable)
+if(NOT bundle_executable STREQUAL executable)
+    message(FATAL_ERROR "Invalid staged app: ${bundle_executable}")
+endif()
+
+# BundleUtilities normally places plain dylibs next to the executable. Keep
+# all embedded code in Frameworks, including transitive dependencies.
+function(gp_item_default_embedded_path_override item path)
+    set(${path} "@executable_path/../Frameworks" PARENT_SCOPE)
+endfunction()
+
+file(MAKE_DIRECTORY "${licenses}")
+file(WRITE "${app}/Contents/Resources/ThirdPartyNotices.txt"
+    "Sharedesk private build: bundled third-party libraries\n\n"
+    "This software is based in part on the work of the Independent JPEG Group.\n"
+    "Full third-party license texts are in Resources/Licenses.\n"
+    "LibVNCClient is GPL-2.0-or-later. This package is for private use; a public\n"
+    "release needs a licensing and corresponding-source distribution review.\n\n")
+
+# Collect notices from the exact installed kegs whose binaries will be copied.
+# Fail rather than silently ship a new dependency without its license notice.
+get_bundle_keys("${app}" "" "${search_dirs}" keys)
+set(noticed_kegs "")
+set(plugins "")
+foreach(key IN LISTS keys)
+    if(NOT "${${key}_COPYFLAG}" STREQUAL "1")
+        continue()
+    endif()
+    get_filename_component(library "${${key}_RESOLVED_ITEM}" REALPATH)
+    if(NOT library MATCHES "/Cellar/([^/]+)/([^/]+)/lib/[^/]+$")
+        message(FATAL_ERROR "Cannot find Homebrew license notices for ${library}")
+    endif()
+    set(package "${CMAKE_MATCH_1}")
+    set(version "${CMAKE_MATCH_2}")
+    get_filename_component(lib_dir "${library}" DIRECTORY)
+    get_filename_component(keg "${lib_dir}" DIRECTORY)
+    if(NOT keg IN_LIST noticed_kegs)
+        file(GLOB notices "${keg}/COPYING*" "${keg}/LICENSE*" "${keg}/NOTICE*" "${keg}/README.ijg")
+        if(NOT notices)
+            message(FATAL_ERROR "No license files found in ${keg}")
+        endif()
+        file(COPY ${notices} DESTINATION "${licenses}/${package}-${version}")
+        file(APPEND "${app}/Contents/Resources/ThirdPartyNotices.txt"
+            "${package} ${version}: Licenses/${package}-${version}/\n")
+        list(APPEND noticed_kegs "${keg}")
+        if(package MATCHES "^openssl(@[0-9]+)?$")
+            # VNC's DES password response uses this dlopen-loaded provider.
+            # otool cannot discover it as a normal linked dependency.
+            set(provider "${keg}/lib/ossl-modules/legacy.dylib")
+            if(NOT EXISTS "${provider}")
+                message(FATAL_ERROR "OpenSSL legacy provider is missing: ${provider}")
+            endif()
+            file(COPY "${provider}" DESTINATION "${app}/Contents/Frameworks/ossl-modules")
+            list(APPEND plugins "${app}/Contents/Frameworks/ossl-modules/legacy.dylib")
+        endif()
+    endif()
+endforeach()
+clear_bundle_keys(keys)
+
+set(BU_CHMOD_BUNDLE_ITEMS TRUE)
+fixup_bundle("${app}" "${plugins}" "${search_dirs}")
+
+# Verify every Mach-O's deployment target and remove build-machine search paths.
+# System frameworks and Swift runtime libraries are supplied by macOS 27+.
+file(GLOB_RECURSE libraries "${app}/Contents/Frameworks/*.dylib")
+set(code_items ${libraries} "${executable}")
+foreach(item IN LISTS code_items)
+    execute_process(COMMAND /usr/bin/otool -l "${item}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE commands ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Cannot inspect ${item}: ${error}")
+    endif()
+    string(REGEX MATCH "minos ([0-9.]+)" minimum "${commands}")
+    if(NOT minimum OR CMAKE_MATCH_1 VERSION_GREATER "@CMAKE_OSX_DEPLOYMENT_TARGET@")
+        message(FATAL_ERROR "${item} requires a newer macOS than @CMAKE_OSX_DEPLOYMENT_TARGET@, or its minimum cannot be verified")
+    endif()
+    get_item_rpaths("${item}" rpaths)
+    foreach(rpath IN LISTS rpaths)
+        if(IS_ABSOLUTE "${rpath}" AND NOT rpath MATCHES "^(/usr/lib/|/System/Library/)")
+            execute_process(COMMAND /usr/bin/install_name_tool -delete_rpath "${rpath}" "${item}"
+                RESULT_VARIABLE result ERROR_VARIABLE error)
+            if(NOT result EQUAL 0)
+                message(FATAL_ERROR "Cannot remove build-machine search path from ${item}: ${error}")
+            endif()
+        endif()
+    endforeach()
+endforeach()
+
+# Ad-hoc signing is suitable for this private installer, not a notarized release.
+# Sign nested code first, then seal the app's plist, icon and license resources.
+foreach(item IN LISTS libraries)
+    execute_process(COMMAND /usr/bin/codesign --force --sign - --timestamp=none "${item}"
+        RESULT_VARIABLE result ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Cannot sign ${item}: ${error}")
+    endif()
+endforeach()
+execute_process(COMMAND /usr/bin/codesign --force --sign - --timestamp=none
+    --identifier net.sharedesk.viewer "${app}" RESULT_VARIABLE result ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Cannot sign Sharedesk.app: ${error}")
+endif()
+execute_process(COMMAND /usr/bin/codesign --verify --deep --strict "${app}"
+    RESULT_VARIABLE result ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Sharedesk.app signature verification failed: ${error}")
+endif()
+message(STATUS "Self-contained, ad-hoc signed Sharedesk.app is ready")
