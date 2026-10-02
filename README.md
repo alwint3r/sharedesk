@@ -70,6 +70,32 @@ python3 scripts/install-autostart.py --remove
 
 This does not stop a host that is already running, and it leaves the password file and logs intact. Use `pgrep -a sharedesk-host` to find a running host and `kill <PID>` to stop it if needed.
 
+## Text clipboard sharing
+
+Clipboard sharing is **off by default**. Add `--clipboard` to enable two-way text sharing with the authenticated viewer:
+
+```sh
+./build/sharedesk-host --listen "$(tailscale ip -4)" \
+  --password-file "$HOME/.sharedesk/vnc-password" \
+  --port 5901 --fps 30 --stats --clipboard
+```
+
+To enable it in the installed autostart copy:
+
+```sh
+python3 scripts/install-autostart.py \
+  --password-file "$HOME/.sharedesk/vnc-password" \
+  --port 5901 --fps 30 --stats --clipboard
+```
+
+Restart the running host, or log out and back in locally, to load the new executable and options. The installer does not restart an existing process. If Screen Sharing offers **Edit → Use Shared Clipboard**, enable it. Clipboard controls depend on the viewer; this host uses standard VNC text messages.
+
+Only Ubuntu's **CLIPBOARD** selection (normal Copy/Paste) is shared. Selecting text for middle-click paste (**PRIMARY**) is not shared. The host does not send an existing Ubuntu clipboard snapshot when a viewer connects; it exports new clipboard changes while authenticated. Imported viewer text remains available to Ubuntu applications after disconnect, until another application takes ownership or the host stops. Pending exports and the per-connection echo cache are cleared on disconnect.
+
+**Privacy:** enabled clipboard sharing is automatic and can transfer passwords or other sensitive text. Sharedesk keeps its clipboard buffers in memory and does not write their contents to logs or files. Other applications or clipboard managers may store shared text. To disable sharing, reinstall without `--clipboard` and restart the host. Preserve your other options, such as `--fps 30 --stats`.
+
+Ubuntu 22.04's standard VNC clipboard protocol uses **Latin-1**, not full Unicode. ASCII, multiline text and Latin-1 characters such as `é` and `£` are supported, up to **1 MiB** of VNC text. X11 UTF-8 text is converted only when it fits Latin-1. Other Unicode text, embedded NUL bytes and oversized Ubuntu copies are ignored rather than corrupted or shortened. LibVNCServer disconnects a viewer that sends a clipboard message larger than 1 MiB; the listener remains available for reconnection. Images, files and formatted clipboard data are not transferred. Large incremental X11 reads are bounded and time out after two seconds; an unavailable clipboard owner does not stop desktop sharing.
+
 ## Performance statistics
 
 Statistics are off by default. Add `--stats` to print one summary to stderr every five seconds, including idle periods:
@@ -116,5 +142,5 @@ Traffic is an estimate from the library's counters, not an exact socket or netwo
 - Reads full-screen images when needed and sends changed 64×64 regions. XDamage reduces unchanged-screen work, but safety refreshes and the polling fallback still read pixels. This is not video-based streaming; CPU use and motion depend on drawing, capture, encoding and the network.
 - X11 keys, pointer buttons and scrolling. Keyboard symbols must be available in the active Ubuntu layout group; unsupported symbols are ignored rather than added to the local keymap. Layout-group switching and locked/latched layout modifiers are not synthesized. Some Mac-specific keys may not map. Local and remote input share the X11 keyboard; they are not isolated devices.
 - Standard VNC cursor-shape updates have one-bit transparency, so soft edges are approximate. Screen-drawn cursors preserve alpha blending. Cursor images above 1024×1024 pixels are ignored; cursors too large for LibVNCServer's cursor-update buffer are drawn in the screen stream for shape-capable viewers.
-- One viewer at a time. No audio, clipboard synchronization, file transfer, or login-screen access.
+- One viewer at a time. Optional text clipboard sharing only; no audio, file transfer, or login-screen access.
 - Existing X11 session only; after reboot, a user must start a desktop session locally.

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <X11/XKBlib.h>
 #include <X11/keysym.h>
 #include <X11/Xproto.h>
@@ -40,6 +41,30 @@ typedef struct {
     uint64_t sent_bytes;
     uint32_t last_sent_bytes;
 } Stats;
+
+#define CLIPBOARD_LIMIT (1U << 20) /* Standard LibVNCServer cut-text limit. */
+#define CLIPBOARD_X_LIMIT (2U * CLIPBOARD_LIMIT) /* Latin-1 expanded to UTF-8. */
+
+typedef struct {
+    int enabled;
+    int active; /* Export selection changes only during an authenticated connection. */
+    Window window; /* Owns imported text; persists across viewer disconnects. */
+    Atom selection, utf8, targets, timestamp, incr, property;
+    Time owned_at;
+    unsigned long owned_after; /* Ignore notifications queued before a newer import. */
+    char *text; /* Owned Latin-1 selection contents, freed on ownership loss. */
+    size_t text_length;
+    char *wire_text; /* Per-connection echo suppression, not a clipboard log. */
+    size_t wire_length;
+    Window reader; /* A fresh requestor isolates each asynchronous transfer. */
+    Time requested_at;
+    Atom requested_target, received_type;
+    int incremental;
+    unsigned char *received;
+    size_t received_length;
+    int64_t deadline_ns;
+    size_t max_property_bytes;
+} Clipboard;
 
 /* A single-threaded X11 host. LibVNCServer owns the client sockets; we own the
  * X connection, framebuffer and per-report statistics. All callbacks run from
@@ -93,6 +118,7 @@ typedef struct {
     int keymap_dirty;
     int keyboard_read_failed;
     Stats stats;
+    Clipboard clipboard;
 } Host;
 
 static volatile sig_atomic_t stopping = 0;
@@ -155,6 +181,270 @@ static void display_finished(rfbClientPtr client, int success) {
 }
 
 static void process_x_events(Host *host);
+
+/* Foreign selection requestors can disappear while we reply. Trap only their
+ * BadWindow errors; other X11 errors retain the normal handler. */
+static Window clipboard_reply_window;
+static XErrorHandler clipboard_previous_error;
+
+static int clipboard_error(Display *display, XErrorEvent *error) {
+    if (error->error_code == BadWindow && error->resourceid == clipboard_reply_window) return 0;
+    return clipboard_previous_error(display, error);
+}
+
+static void cancel_clipboard_read(Host *host) {
+    Clipboard *clip = &host->clipboard;
+    if (clip->reader) XDestroyWindow(host->display, clip->reader);
+    clip->reader = None;
+    free(clip->received);
+    clip->received = NULL;
+    clip->received_length = 0;
+    clip->incremental = 0;
+    clip->deadline_ns = 0;
+}
+
+static void reset_clipboard_connection(Host *host) {
+    cancel_clipboard_read(host);
+    host->clipboard.active = 0;
+    free(host->clipboard.wire_text);
+    host->clipboard.wire_text = NULL;
+    host->clipboard.wire_length = 0;
+}
+
+static void clipboard_from_viewer(char *text, int length, rfbClientPtr client) {
+    Host *host = client->screen->screenData;
+    Clipboard *clip = &host->clipboard;
+    if (!clip->enabled || client != host->client || client->state != RFB_NORMAL ||
+        client->sock == RFB_INVALID_SOCKET || length < 0 || (unsigned int)length > CLIPBOARD_LIMIT ||
+        (length && memchr(text, '\0', (size_t)length))) return;
+    if (!clip->active) {
+        process_x_events(host); /* Discard selection changes from before authentication. */
+        clip->active = 1;
+    }
+    char *owned = malloc((size_t)length + 1), *wire = malloc((size_t)length + 1);
+    if (!owned || !wire) {
+        free(owned);
+        free(wire);
+        fprintf(stderr, "Clipboard import unavailable: allocation failed\n");
+        return;
+    }
+    memcpy(owned, text, (size_t)length);
+    memcpy(wire, text, (size_t)length);
+    owned[length] = wire[length] = '\0';
+    cancel_clipboard_read(host);
+    free(clip->text);
+    free(clip->wire_text);
+    clip->text = owned;
+    clip->text_length = (size_t)length;
+    clip->wire_text = wire;
+    clip->wire_length = (size_t)length;
+    clip->owned_at = CurrentTime;
+    clip->owned_after = NextRequest(host->display);
+    XSetSelectionOwner(host->display, clip->selection, clip->window, CurrentTime);
+    XFlush(host->display);
+}
+
+static void clipboard_event(Host *host, XEvent *event) {
+    Clipboard *clip = &host->clipboard;
+    if (!clip->enabled) return;
+    if (event->type == host->cursor_event_base + XFixesSelectionNotify &&
+        ((XFixesSelectionNotifyEvent *)event)->selection == clip->selection) {
+        XFixesSelectionNotifyEvent *selection = (XFixesSelectionNotifyEvent *)event;
+        if (selection->serial < clip->owned_after) return;
+        if (selection->owner == clip->window) {
+            clip->owned_at = selection->selection_timestamp;
+            return;
+        }
+        free(clip->text);
+        clip->text = NULL;
+        clip->text_length = 0;
+        cancel_clipboard_read(host);
+        if (!clip->active || !host->client || host->client->state != RFB_NORMAL ||
+            host->client->sock == RFB_INVALID_SOCKET || selection->owner == None) return;
+        clip->reader = XCreateSimpleWindow(host->display, host->root, 0, 0, 1, 1, 0, 0, 0);
+        XSelectInput(host->display, clip->reader, PropertyChangeMask);
+        clip->requested_at = selection->selection_timestamp;
+        clip->requested_target = clip->utf8;
+        clip->received_type = None;
+        clip->deadline_ns = monotonic_ns() + 2000000000LL;
+        XConvertSelection(host->display, clip->selection, clip->utf8, clip->property,
+                          clip->reader, clip->requested_at);
+        XFlush(host->display);
+        return;
+    }
+    if (event->type == SelectionClear && event->xselectionclear.window == clip->window) {
+        /* A delayed clear may precede a newer import that already reclaimed it. */
+        if (XGetSelectionOwner(host->display, clip->selection) != clip->window) {
+            free(clip->text);
+            clip->text = NULL;
+            clip->text_length = 0;
+        }
+        return;
+    }
+    if (event->type == SelectionRequest && event->xselectionrequest.owner == clip->window) {
+        XSelectionRequestEvent *request = &event->xselectionrequest;
+        XEvent reply = {0};
+        reply.xselection = (XSelectionEvent){.type = SelectionNotify, .display = host->display,
+            .requestor = request->requestor, .selection = request->selection,
+            .target = request->target, .time = request->time, .property = None};
+        Atom property = request->property ? request->property : request->target;
+        unsigned char *converted = NULL;
+        const unsigned char *data = (const unsigned char *)clip->text;
+        size_t length = clip->text_length;
+        Atom type = XA_STRING;
+        int format = 8;
+        Atom offered[] = {clip->targets, clip->timestamp, clip->utf8, XA_STRING};
+        unsigned long timestamp = clip->owned_at;
+        int valid = clip->text && request->selection == clip->selection &&
+            (request->time == CurrentTime || clip->owned_at == CurrentTime ||
+             (int32_t)(request->time - clip->owned_at) >= 0);
+        if (request->target == clip->targets) {
+            data = (const unsigned char *)offered;
+            length = sizeof offered / sizeof offered[0];
+            type = XA_ATOM;
+            format = 32;
+        } else if (request->target == clip->timestamp) {
+            data = (const unsigned char *)&timestamp;
+            length = 1;
+            type = XA_INTEGER;
+            format = 32;
+        } else if (request->target == clip->utf8 && valid) {
+            converted = malloc(length * 2 + 1);
+            if (!converted) valid = 0;
+            else {
+                size_t count = 0;
+                for (size_t i = 0; i < length; ++i) {
+                    unsigned char c = data[i];
+                    if (c >= 128) converted[count++] = (unsigned char)(0xc0 | (c >> 6));
+                    converted[count++] = c < 128 ? c : (unsigned char)(0x80 | (c & 63));
+                }
+                data = converted;
+                length = count;
+                type = clip->utf8;
+            }
+        } else if (request->target != XA_STRING) valid = 0;
+        if (length > clip->max_property_bytes / (size_t)(format / 8)) valid = 0;
+        XSync(host->display, False);
+        clipboard_reply_window = request->requestor;
+        clipboard_previous_error = XSetErrorHandler(clipboard_error);
+        if (valid) {
+            XChangeProperty(host->display, request->requestor, property, type, format,
+                            PropModeReplace, data, (int)length);
+            reply.xselection.property = property;
+        }
+        XSendEvent(host->display, request->requestor, False, 0, &reply);
+        XSync(host->display, False);
+        XSetErrorHandler(clipboard_previous_error);
+        clipboard_reply_window = None;
+        free(converted);
+        return;
+    }
+    int initial = event->type == SelectionNotify && clip->reader &&
+        event->xselection.requestor == clip->reader && event->xselection.selection == clip->selection &&
+        event->xselection.target == clip->requested_target && event->xselection.time == clip->requested_at;
+    int chunk = event->type == PropertyNotify && clip->reader && clip->incremental &&
+        event->xproperty.window == clip->reader && event->xproperty.atom == clip->property &&
+        event->xproperty.state == PropertyNewValue;
+    if (!initial && !chunk) return;
+    if (monotonic_ns() >= clip->deadline_ns) {
+        fprintf(stderr, "Clipboard export timed out; desktop sharing remains available\n");
+        cancel_clipboard_read(host);
+        return;
+    }
+    if (initial && event->xselection.property == None) {
+        if (clip->requested_target == clip->utf8) {
+            clip->requested_target = XA_STRING;
+            XConvertSelection(host->display, clip->selection, XA_STRING, clip->property,
+                              clip->reader, clip->requested_at);
+            XFlush(host->display);
+        } else cancel_clipboard_read(host);
+        return;
+    }
+    if (initial && event->xselection.property != clip->property) {
+        cancel_clipboard_read(host);
+        return;
+    }
+    Atom type;
+    int format;
+    unsigned long length, remaining;
+    unsigned char *value = NULL;
+    int status = XGetWindowProperty(host->display, clip->reader, clip->property, 0,
+        CLIPBOARD_X_LIMIT / 4 + 1, True, AnyPropertyType, &type, &format, &length, &remaining, &value);
+    if (status != Success || remaining || type == None) {
+        if (value) XFree(value);
+        cancel_clipboard_read(host);
+        return;
+    }
+    if (initial && type == clip->incr) {
+        /* Some owners (including xclip) omit the advisory size. The actual
+         * chunks remain bounded by our byte limit and total timeout. */
+        int valid = format == 32 && (length == 0 ||
+            (length == 1 && *(unsigned long *)value <= CLIPBOARD_X_LIMIT));
+        XFree(value);
+        if (valid) clip->incremental = 1;
+        else cancel_clipboard_read(host);
+        XFlush(host->display); /* Deleting the INCR marker acknowledges readiness. */
+        return;
+    }
+    int valid = format == 8 && (type == clip->utf8 || type == XA_STRING) &&
+        (clip->received_type == None || type == clip->received_type) &&
+        length <= CLIPBOARD_X_LIMIT - clip->received_length;
+    if (!valid) {
+        XFree(value);
+        cancel_clipboard_read(host);
+        fprintf(stderr, "Clipboard export ignored: invalid or oversized text\n");
+        return;
+    }
+    clip->received_type = type;
+    if (length) {
+        unsigned char *received = realloc(clip->received, clip->received_length + length + 1);
+        if (!received) {
+            XFree(value);
+            cancel_clipboard_read(host);
+            return;
+        }
+        clip->received = received;
+        memcpy(received + clip->received_length, value, length);
+        clip->received_length += length;
+    }
+    XFree(value);
+    XFlush(host->display);
+    if (clip->incremental && length) return;
+    /* Standard RFB cut text is Latin-1, not UTF-8. Refuse unrepresentable text
+     * rather than corrupting Unicode or silently replacing characters. */
+    size_t count = 0;
+    for (size_t i = 0; i < clip->received_length; ++i) {
+        unsigned char c = clip->received[i];
+        if (!c) { valid = 0; break; }
+        if (type == clip->utf8 && c >= 128) {
+            if ((c != 0xc2 && c != 0xc3) || i + 1 >= clip->received_length ||
+                (clip->received[i + 1] & 0xc0) != 0x80) { valid = 0; break; }
+            c = (unsigned char)(((c & 3) << 6) | (clip->received[++i] & 63));
+        }
+        clip->received[count++] = c;
+    }
+    if (count > CLIPBOARD_LIMIT) valid = 0;
+    if (valid && clip->active && host->client && host->client->state == RFB_NORMAL &&
+        host->client->sock != RFB_INVALID_SOCKET &&
+        (!clip->wire_text || clip->wire_length != count ||
+         (count && memcmp(clip->wire_text, clip->received, count)))) {
+        char *wire = malloc(count + 1);
+        if (wire) {
+            if (count) memcpy(wire, clip->received, count);
+            wire[count] = '\0';
+            free(clip->wire_text);
+            clip->wire_text = wire;
+            clip->wire_length = count;
+            /* Clipboard writes are synchronous in LibVNCServer. Bound a slow
+             * viewer's wait; the existing capture/input loop owns all work. */
+            int previous_wait = host->screen->maxClientWait;
+            host->screen->maxClientWait = 1000;
+            rfbSendServerCutText(host->screen, wire, (int)count);
+            host->screen->maxClientWait = previous_wait;
+        }
+    } else if (!valid) fprintf(stderr, "Clipboard export ignored: text is not Latin-1 or exceeds 1 MiB\n");
+    cancel_clipboard_read(host);
+}
 
 static int refresh_keyboard(Host *host) {
     XkbDescPtr map = XkbGetMap(host->display, XkbAllMapComponentsMask, XkbUseCoreKbd);
@@ -232,6 +522,7 @@ static void client_gone(rfbClientPtr client) {
         /* The library frees the client's statistics after this callback. */
         sample_client_bytes(host, client);
         release_input(host);
+        reset_clipboard_connection(host);
         if (host->cursor_composited) {
             memcpy(host->pixels, host->raw_pixels, (size_t)host->width * host->height * 4);
             host->cursor_composited = 0;
@@ -566,6 +857,8 @@ static void process_x_events(Host *host) {
         } else if (event.type == MappingNotify) {
             XRefreshKeyboardMapping(&event.xmapping);
             if (event.xmapping.request != MappingPointer) host->keymap_dirty = 1;
+        } else {
+            clipboard_event(host, &event);
         }
     }
 }
@@ -1050,15 +1343,16 @@ compose_frame:
 int main(int argc, char **argv) {
     const char *listen_ip = NULL;
     const char *password_file = NULL;
-    int port = 5900, fps = 10, stats_enabled = 0;
+    int port = 5900, fps = 10, stats_enabled = 0, clipboard_enabled = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen_ip = argv[++i];
         else if (!strcmp(argv[i], "--password-file") && i + 1 < argc) password_file = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = parse_number(argv[++i], 1, 65535);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = parse_number(argv[++i], 1, 30);
         else if (!strcmp(argv[i], "--stats")) stats_enabled = 1;
+        else if (!strcmp(argv[i], "--clipboard")) clipboard_enabled = 1;
         else {
-            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> --password-file <file> [--port 5900] [--fps 10] [--stats]\n", argv[0]);
+            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> --password-file <file> [--port 5900] [--fps 10] [--stats] [--clipboard]\n", argv[0]);
             return 2;
         }
     }
@@ -1190,6 +1484,7 @@ int main(int argc, char **argv) {
     host.screen->newClientHook = new_client;
     host.screen->kbdAddEvent = keyboard_event;
     host.screen->ptrAddEvent = pointer_event;
+    host.screen->setXCutText = clipboard_from_viewer; /* Disabled unless explicitly enabled. */
     host.screen->getCursorPtr = viewer_cursor;
     if (stats_enabled) host.screen->displayFinishedHook = display_finished;
     /* A cursor image can be unavailable during session/display startup. Keep
@@ -1227,6 +1522,27 @@ int main(int argc, char **argv) {
         XCloseDisplay(host.display);
         return 1;
     }
+    if (clipboard_enabled) {
+        Clipboard *clip = &host.clipboard;
+        char *names[] = {"CLIPBOARD", "UTF8_STRING", "TARGETS", "TIMESTAMP", "INCR", "_SHAREDESK_CLIPBOARD"};
+        Atom atoms[6];
+        if (XInternAtoms(host.display, names, 6, False, atoms)) {
+            clip->selection = atoms[0]; clip->utf8 = atoms[1]; clip->targets = atoms[2];
+            clip->timestamp = atoms[3]; clip->incr = atoms[4]; clip->property = atoms[5];
+            clip->window = XCreateSimpleWindow(host.display, host.root, 0, 0, 1, 1, 0, 0, 0);
+            long words = XExtendedMaxRequestSize(host.display);
+            if (!words) words = XMaxRequestSize(host.display);
+            clip->max_property_bytes = words > 64 ? (size_t)(words - 64) * 4 : 0;
+            if (clip->window) {
+                clip->enabled = 1;
+                XFixesSelectSelectionInput(host.display, clip->window, clip->selection,
+                    XFixesSetSelectionOwnerNotifyMask | XFixesSelectionWindowDestroyNotifyMask |
+                    XFixesSelectionClientCloseNotifyMask);
+                fprintf(stderr, "Text clipboard sharing enabled (Latin-1, up to 1 MiB)\n");
+            }
+        }
+        if (!clip->enabled) fprintf(stderr, "Clipboard initialization failed; desktop sharing remains available\n");
+    }
     fprintf(stderr, "Capture method: %s; changes: %s\n",
             host.shm_enabled ? "xshm (shared memory)" : "xgetimage",
             host.damage ? "xdamage (with 1-second safety refresh)" : "polling");
@@ -1247,6 +1563,15 @@ int main(int argc, char **argv) {
          * retain the previous cursor until the next shape notification. */
         (void)update_cursor(&host);
         int64_t current = monotonic_ns();
+        if (host.clipboard.enabled) {
+            if (host.client && host.client->state == RFB_NORMAL && host.client->sock != RFB_INVALID_SOCKET)
+                host.clipboard.active = 1; /* Pre-authentication events were drained above. */
+            else if (host.clipboard.active) reset_clipboard_connection(&host);
+            if (host.clipboard.reader && current >= host.clipboard.deadline_ns) {
+                fprintf(stderr, "Clipboard export timed out; desktop sharing remains available\n");
+                cancel_clipboard_read(&host);
+            }
+        }
         for (int key = 1; key < 256; ++key) {
             if (host.keys[key] == 2 && host.key_repeat_at[key] && current >= host.key_repeat_at[key]) {
                 if (press_key(&host, host.key_symbols[key], (KeyCode)key) != 0) {
@@ -1320,6 +1645,9 @@ int main(int argc, char **argv) {
     free(host.next_pixels);
     free(host.raw_pixels);
     XkbFreeKeyboard(host.keymap, XkbAllComponentsMask, True);
+    reset_clipboard_connection(&host);
+    free(host.clipboard.text);
+    if (host.clipboard.window) XDestroyWindow(host.display, host.clipboard.window);
     XCloseDisplay(host.display);
     memset(password, 0, sizeof password);
     return result;
