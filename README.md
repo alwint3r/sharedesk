@@ -19,6 +19,9 @@ viewer/
   ViewerApplication.swift     # Window, controls and main-thread clipboard
   DesktopView.swift           # Rendering, cursor and input
   VNCSession.swift            # Worker, session state, queues and deadlines
+  ConnectionProfiles.swift    # Validated profile settings and private file storage
+  ProfileEditor.swift         # Native Add/Edit dialog
+  ProfilePasswords.swift      # Optional macOS Keychain credentials
   VNCBridge.c                 # LibVNCClient callbacks and buffer ownership
   VNCBridge.h
   module.modulemap            # Swift import of the C bridge
@@ -58,7 +61,7 @@ CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift an
 
 One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
 
-Disconnect Screen Sharing first; the host accepts one viewer at a time. Enter Ubuntu's **numeric Tailscale IPv4**, port **5901**, and the same VNC password as the host, then click **Connect**. The viewer also allows loopback IPv4 for local connections. DNS names, public addresses, unauthenticated servers, and IPv6 are not supported. Passwords are cleared from the field when connecting and are not saved. Re-enter the password to reconnect; reconnects are manual.
+Disconnect Screen Sharing first; the host accepts one viewer at a time. Enter Ubuntu's **numeric Tailscale IPv4**, port **5901**, and the same VNC password as the host, then click **Connect**. The viewer also allows loopback IPv4 for local connections. DNS names, public addresses, unauthenticated servers, and IPv6 are not supported. Passwords are cleared from the field when connecting. Manual connections do not save passwords; connection profiles can optionally remember them in macOS Keychain. Reconnects remain manual.
 
 The viewer uses elapsed-time deadlines: three seconds for TCP connection setup, five seconds per authentication/initialization operation, and twenty seconds per incoming VNC message or outgoing input/clipboard packet. An unchanged desktop has no idle timeout. **Disconnect** cancels pending network I/O. These application deadlines replace LibVNCClient 0.9.15's retry-count timeout, which can reject healthy fragmented transfers too early. Already-buffered messages are processed without waiting for further network traffic.
 
@@ -69,6 +72,20 @@ Keyboard input initially targets English (US) direct keys, including Shift punct
 For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard (Latin-1)** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
 
 Clipboard sharing is off by default in both programs. The viewer rejects unrepresentable Unicode, NUL-containing text and text over 1 MiB without shortening it. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
+
+### Connection profiles
+
+Use **Add…** beside the profile selector to save a name, Tailscale/loopback IPv4, port and clipboard setting. Profile names must be unique, ignoring case. Select a saved profile to fill the connection fields, then click **Connect**. Selecting a profile never connects automatically. The viewer starts with **Manual connection** selected; that option remains available for connections you do not want to save.
+
+**Remember password in macOS Keychain** is off by default for new profiles. Enable it and enter the VNC password to connect without typing it again. macOS may ask for Keychain access; a new development build may need renewed permission. The password field stays empty when a profile is selected. An entered password overrides the saved password for that connection only; it does not silently update Keychain.
+
+Use **Edit…** to rename a profile or change its settings. Leave the saved-password field blank to keep its existing password. Changing the address or port requires entering a new password if you want to keep Keychain storage enabled. Temporarily changing the main connection fields does not change the profile, and a saved password is never automatically reused for a different address or port. Profile editing is disabled while connecting or connected.
+
+Disable **Remember password** in the editor to remove its Keychain item. **Delete…** removes the profile and attempts to remove its saved password, without changing the remote host. If Keychain removal fails, Sharedesk reports the partial success; remove the remaining **Sharedesk VNC** item through Keychain Access. The Keychain service is `net.sharedesk.viewer.vnc-password`. Long status messages are available in full by hovering over the status text.
+
+Settings live in `~/.sharedesk/profiles.json` on the Mac, with permission 600 inside a directory with permission 700. The JSON contains settings and optional credential references, never passwords. Writes replace the file atomically. Invalid, unreadable, oversized or externally changed files are not silently overwritten. Manual connections remain available if saved profiles cannot be loaded. Reopen the viewer after resolving a file error to reload its profiles.
+
+A profile can remember that clipboard sharing is enabled, but neither selecting it nor connecting sends an old clipboard snapshot. Clipboard privacy and Latin-1 limits remain unchanged.
 
 ### Regenerate the viewer icon
 

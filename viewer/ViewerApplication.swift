@@ -4,6 +4,12 @@ import Darwin
 @MainActor
 final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
+    private let profileStore = ConnectionProfileStore(fileURL: FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".sharedesk", isDirectory: true).appendingPathComponent("profiles.json"))
+    private var profilePopup: NSPopUpButton!
+    private var addProfileButton: NSButton!
+    private var editProfileButton: NSButton!
+    private var deleteProfileButton: NSButton!
     private var hostField: NSTextField!
     private var portField: NSTextField!
     private var passwordField: NSSecureTextField!
@@ -46,6 +52,17 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.acceptsMouseMovedEvents = true
+        profilePopup = NSPopUpButton()
+        profilePopup.target = self
+        profilePopup.action = #selector(profileChanged(_:))
+        profilePopup.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        addProfileButton = NSButton(title: "Add…", target: self, action: #selector(addProfile(_:)))
+        editProfileButton = NSButton(title: "Edit…", target: self, action: #selector(editSelectedProfile(_:)))
+        deleteProfileButton = NSButton(title: "Delete…", target: self, action: #selector(deleteProfile(_:)))
+        let profileRow = NSStackView(views: [NSTextField(labelWithString: "Profile"), profilePopup,
+                                            addProfileButton, editProfileButton, deleteProfileButton])
+        profileRow.orientation = .horizontal
+        profileRow.spacing = 8
         hostField = NSTextField(string: "")
         hostField.placeholderString = "Tailscale IPv4"
         portField = NSTextField(string: "5901")
@@ -68,9 +85,10 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         desktop = DesktopView()
         desktop.controller = self
         desktop.setContentHuggingPriority(.defaultLow, for: .vertical)
-        statusField = NSTextField(labelWithString: "Private VNC connection. Clipboard is off until you enable it. Passwords are not saved.")
+        statusField = NSTextField(labelWithString: "Private VNC connection. Clipboard is opt-in. Saved passwords use macOS Keychain.")
         statusField.font = .systemFont(ofSize: 11)
-        let stack = NSStackView(views: [connection, options, desktop, statusField])
+        statusField.lineBreakMode = .byTruncatingTail
+        let stack = NSStackView(views: [profileRow, connection, options, desktop, statusField])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -83,8 +101,12 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             desktop.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            statusField.widthAnchor.constraint(equalTo: stack.widthAnchor),
             desktop.heightAnchor.constraint(greaterThanOrEqualToConstant: 240)
         ])
+        do { try profileStore.load() }
+        catch { showStatus("Saved profiles unavailable: \(error.localizedDescription) Manual connections are still available.") }
+        refreshProfiles(selectedID: nil)
         pasteboardChange = pasteboard.changeCount
         let timer = Timer(timeInterval: 1.0 / 60, target: self, selector: #selector(poll(_:)), userInfo: nil, repeats: true)
         self.timer = timer
@@ -102,20 +124,26 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             connectButton.isEnabled = false
             return
         }
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        var address = in_addr()
-        let ip: UInt32 = host.withCString { inet_pton(AF_INET, $0, &address) == 1 ? UInt32(bigEndian: address.s_addr) : 0 }
-        let scanner = Scanner(string: portField.stringValue)
-        let password = passwordField.stringValue
-        let ascii = password.data(using: .ascii, allowLossyConversion: false)
-        let validPassword = ascii.map { (1...8).contains($0.count) && $0.allSatisfy { (33...126).contains($0) } } ?? false
-        guard (ip & 0xffc00000 == 0x64400000 || ip & 0xff000000 == 0x7f000000),
-              let port = scanner.scanInt(), scanner.isAtEnd, (1...65535).contains(port), validPassword else {
-            statusField.stringValue = "Use a Tailscale/loopback IPv4, port 1–65535 and a 1–8 character ASCII VNC password."
+        let target: ConnectionTarget
+        var password = passwordField.stringValue
+        do {
+            target = try ConnectionTarget(host: hostField.stringValue, portText: portField.stringValue)
+            if password.isEmpty, let profile = selectedProfile, let reference = profile.passwordReference {
+                guard target == profile.target else {
+                    showStatus("The address or port differs from the saved profile. Enter a password for this connection or edit the profile.")
+                    window.makeFirstResponder(passwordField)
+                    return
+                }
+                password = try ProfilePasswords.read(reference: reference, target: target)
+            }
+            guard validVNCPassword(password) else { throw PasswordError.invalidPassword }
+        } catch {
+            showStatus(error.localizedDescription)
+            window.makeFirstResponder(passwordField)
             return
         }
         desktop.clearDesktop()
-        let session = VNCSession(host: host, port: port, password: password)
+        let session = VNCSession(host: target.host, port: target.port, password: password)
         self.session = session
         desktop.session = session
         session.setClipboardSharing(clipboardButton.state == .on)
@@ -124,10 +152,140 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         portField.isEnabled = false
         passwordField.isEnabled = false
         connectButton.title = "Disconnect"
-        statusField.stringValue = "Connecting…"
+        showStatus("Connecting…")
         pasteboardChange = pasteboard.changeCount // Never export the old clipboard on connect.
+        updateProfileControls()
         session.start()
         window.makeFirstResponder(desktop)
+    }
+
+    private func showStatus(_ message: String) {
+        statusField.stringValue = message
+        statusField.toolTip = message // Long errors remain available without widening the window.
+    }
+
+    private var selectedProfile: ConnectionProfile? {
+        guard let id = profilePopup.selectedItem?.representedObject as? UUID else { return nil }
+        return profileStore.profiles.first { $0.id == id }
+    }
+
+    private func refreshProfiles(selectedID: UUID?) {
+        profilePopup.removeAllItems()
+        profilePopup.addItem(withTitle: "Manual connection")
+        for profile in profileStore.profiles {
+            profilePopup.addItem(withTitle: profile.name)
+            let item = profilePopup.lastItem!
+            item.representedObject = profile.id
+            item.toolTip = "\(profile.target.host):\(profile.target.port)"
+            if profile.id == selectedID { profilePopup.select(item) }
+        }
+        updateProfileControls()
+    }
+
+    private func updateProfileControls() {
+        let editable = session == nil && profileStore.loaded
+        profilePopup.isEnabled = editable
+        addProfileButton.isEnabled = editable
+        editProfileButton.isEnabled = editable && selectedProfile != nil
+        deleteProfileButton.isEnabled = editable && selectedProfile != nil
+    }
+
+    @objc private func profileChanged(_ sender: Any?) {
+        guard session == nil else { return }
+        let profile = selectedProfile
+        hostField.stringValue = profile?.target.host ?? ""
+        portField.stringValue = profile.map { String($0.target.port) } ?? "5901"
+        passwordField.stringValue = ""
+        passwordField.placeholderString = profile?.passwordReference != nil ? "Keychain password or override" : "VNC password"
+        clipboardButton.state = profile?.shareClipboard == true ? .on : .off
+        clipboardChanged(nil) // Selecting/enabling never exports the old clipboard.
+        updateProfileControls()
+        showStatus(profile?.passwordReference != nil
+            ? "Profile selected. Connect will read its password from macOS Keychain."
+            : "Enter the VNC password, then connect.")
+        window.makeFirstResponder(profile?.passwordReference != nil ? connectButton : passwordField)
+    }
+
+    @objc private func addProfile(_ sender: Any?) { editProfile(nil) }
+    @objc private func editSelectedProfile(_ sender: Any?) {
+        guard let profile = selectedProfile else { return }
+        editProfile(profile)
+    }
+
+    private func editProfile(_ existing: ConnectionProfile?) {
+        guard session == nil, profileStore.loaded else { return }
+        let editor = ProfileEditor(profile: existing, host: hostField.stringValue, port: portField.stringValue,
+                                   shareClipboard: clipboardButton.state == .on)
+        let guidance = editor.alert.informativeText
+        defer { editor.passwordField.stringValue = "" }
+        while editor.alert.runModal() == .alertFirstButtonReturn {
+            var createdPassword: (reference: UUID, target: ConnectionTarget)?
+            do {
+                let target = try ConnectionTarget(host: editor.hostField.stringValue, portText: editor.portField.stringValue)
+                let password = editor.passwordField.stringValue
+                var reference: UUID?
+                if editor.rememberButton.state == .on {
+                    if password.isEmpty {
+                        guard let previous = existing, previous.target == target, let saved = previous.passwordReference else {
+                            throw PasswordError.invalidPassword
+                        }
+                        reference = saved
+                    } else {
+                        guard validVNCPassword(password) else { throw PasswordError.invalidPassword }
+                        reference = UUID()
+                    }
+                }
+                let profile = try ConnectionProfile(id: existing?.id ?? UUID(), name: editor.nameField.stringValue,
+                                                    target: target, shareClipboard: editor.clipboardButton.state == .on,
+                                                    passwordReference: reference)
+                try profileStore.check(profile)
+                if let reference, !password.isEmpty {
+                    try ProfilePasswords.save(password, reference: reference, target: target)
+                    createdPassword = (reference, target)
+                }
+                try profileStore.upsert(profile)
+                // Once settings commit, the new reference belongs to the profile.
+                createdPassword = nil
+                refreshProfiles(selectedID: profile.id)
+                profileChanged(nil)
+                showStatus("Profile saved.")
+                if let previous = existing, let old = previous.passwordReference, old != reference {
+                    do { try ProfilePasswords.remove(reference: old, target: previous.target) }
+                    catch {
+                        showStatus("Profile saved, but its previous password could not be removed from Keychain. Remove the Sharedesk VNC item with account \(old.uuidString)@\(previous.target.host):\(previous.target.port) in Keychain Access. \(error.localizedDescription)")
+                    }
+                }
+                return
+            } catch {
+                var message = error.localizedDescription
+                if let createdPassword {
+                    do { try ProfilePasswords.remove(reference: createdPassword.reference, target: createdPassword.target) }
+                    catch { message += " The unused password could not be removed from Keychain; remove the Sharedesk VNC item with account \(createdPassword.reference.uuidString)@\(createdPassword.target.host):\(createdPassword.target.port) in Keychain Access. \(error.localizedDescription)" }
+                }
+                editor.alert.informativeText = guidance + "\n\n" + message
+            }
+        }
+    }
+
+    @objc private func deleteProfile(_ sender: Any?) {
+        guard session == nil, let profile = selectedProfile else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete \(profile.name)?"
+        alert.informativeText = "Remove this profile from the Mac and remove its saved password from Keychain, if present. This does not change the host."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try profileStore.remove(id: profile.id)
+            refreshProfiles(selectedID: nil)
+            profileChanged(nil)
+            showStatus("Profile deleted.")
+            if let reference = profile.passwordReference {
+                do { try ProfilePasswords.remove(reference: reference, target: profile.target) }
+                catch { showStatus("Profile deleted, but its password could not be removed from Keychain. Remove the Sharedesk VNC item with account \(reference.uuidString)@\(profile.target.host):\(profile.target.port) in Keychain Access. \(error.localizedDescription)") }
+            }
+        } catch { showStatus("Profile was not deleted: \(error.localizedDescription)") }
     }
 
     @objc private func clipboardChanged(_ sender: Any?) {
@@ -148,16 +306,16 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard force || change != pasteboardChange else { return }
         pasteboardChange = change
         guard let text = pasteboard.string(forType: .string) else {
-            if force { statusField.stringValue = "No text is available on the Mac clipboard." }
+            if force { showStatus("No text is available on the Mac clipboard.") }
             return
         }
         guard let data = text.data(using: .isoLatin1, allowLossyConversion: false),
               data.count <= clipboardLimit, !data.contains(0) else {
-            statusField.stringValue = "Clipboard was not sent: use Latin-1 text up to 1 MiB, without NUL bytes."
+            showStatus("Clipboard was not sent: use Latin-1 text up to 1 MiB, without NUL bytes.")
             return
         }
         session?.sendClipboard(data)
-        statusField.stringValue = "Mac clipboard queued for Ubuntu. Paste there with the application's Ubuntu shortcut."
+        showStatus("Mac clipboard queued for Ubuntu. Paste there with the application's Ubuntu shortcut.")
     }
 
     @objc private func poll(_ timer: Timer) {
@@ -170,7 +328,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             pasteboardChange = pasteboard.changeCount
             window.makeFirstResponder(desktop)
         }
-        if ready != wasReady || update.state.finished { statusField.stringValue = update.state.message }
+        if ready != wasReady || update.state.finished { showStatus(update.state.message) }
         if let frame = update.frame { desktop.showFrame(frame) }
         if let cursor = update.cursor { desktop.showCursor(cursor) }
         if let data = update.clipboard, clipboardButton.state == .on, ready,
@@ -178,7 +336,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             pasteboard.clearContents()
             let written = pasteboard.setString(text, forType: .string)
             pasteboardChange = pasteboard.changeCount // Suppress our own echo.
-            statusField.stringValue = written ? "Ubuntu text received on the Mac clipboard." : "Could not write the received text to the Mac clipboard."
+            showStatus(written ? "Ubuntu text received on the Mac clipboard." : "Could not write the received text to the Mac clipboard.")
         }
         sendButton.isEnabled = ready && clipboardButton.state == .on
         let now = ProcessInfo.processInfo.systemUptime
@@ -197,6 +355,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             passwordField.isEnabled = true
             connectButton.title = "Connect"
             connectButton.isEnabled = true
+            updateProfileControls()
             if terminating { NSApp.reply(toApplicationShouldTerminate: true) }
         }
     }
