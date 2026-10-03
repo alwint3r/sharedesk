@@ -72,6 +72,7 @@ enum ClipboardSendStatus {
 
 struct SessionUpdate: Sendable {
     let state: SessionState
+    let established: Bool // Remains true after loss, even if UI missed the connected snapshot.
     let frame: PixelFrame?
     let cursor: RemoteCursor?
     let clipboard: Data? // Canonical UTF-8, including when received through Latin-1.
@@ -88,6 +89,7 @@ final class VNCSession: @unchecked Sendable {
     private var password: String? // Worker-only after start; discarded after authentication.
     private let lock = NSLock()
     private var state: SessionState = .connecting
+    private var established = false // Lifecycle history, under lock; no credentials retained.
     private var stopReason: SessionEnd?
     private var cancelSocket: Int32 = -1 // Owned duplicate; shutdown cancels C I/O.
     private var ioDeadline: TimeInterval = 0
@@ -115,7 +117,10 @@ final class VNCSession: @unchecked Sendable {
 
     func stop() {
         lock.withLock {
-            if stopReason == nil { stopReason = .disconnected }
+            guard !state.finished else { return }
+            let reason = stopReason ?? .disconnected
+            stopReason = reason
+            state = .stopping(reason)
             if cancelSocket >= 0 { _ = shutdown(cancelSocket, SHUT_RDWR) }
         }
     }
@@ -168,6 +173,7 @@ final class VNCSession: @unchecked Sendable {
             }
             guard queuedBytes + packet.count <= 2 << 20, packets.count < 2048 else {
                 stopReason = .queueFull
+                state = .stopping(.queueFull)
                 if cancelSocket >= 0 { _ = shutdown(cancelSocket, SHUT_RDWR) }
                 return false
             }
@@ -202,7 +208,7 @@ final class VNCSession: @unchecked Sendable {
                 FileHandle.standardError.write(Data("Sharedesk: network operation exceeded its elapsed-time deadline\n".utf8))
                 if cancelSocket >= 0 { _ = shutdown(cancelSocket, SHUT_RDWR) }
             }
-            let update = SessionUpdate(state: state, frame: pendingFrame, cursor: pendingCursor, clipboard: pendingClipboard,
+            let update = SessionUpdate(state: state, established: established, frame: pendingFrame, cursor: pendingCursor, clipboard: pendingClipboard,
                                        clipboardUTF8: clipboardUTF8, clipboardError: pendingClipboardError)
             pendingFrame = nil
             pendingCursor = nil
@@ -248,6 +254,7 @@ final class VNCSession: @unchecked Sendable {
             connected = lock.withLock {
                 guard healthy, stopReason == nil else { return false }
                 state = .connected
+                established = true
                 return true
             }
             while healthy && connected {

@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 
 @MainActor
-final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private var window: NSWindow!
     private let profileStore = ConnectionProfileStore(fileURL: FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".sharedesk", isDirectory: true).appendingPathComponent("profiles.json"))
@@ -28,6 +28,10 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var zoomControl: NSSegmentedControl!
     private let zoomLevels: [CGFloat] = [1, 1.25, 1.5, 2, 3, 4]
     private var session: VNCSession?
+    private var connectionState: SessionState = .finished(.disconnected)
+    private var sessionEstablished = false
+    // Connection fields remain the endpoint/settings source of truth. No
+    // separate reconnect profile, password cache or automatic retry timer.
     private var timer: Timer?
     private var pasteboard = NSPasteboard.general // Main thread only; never the worker.
     private var pasteboardChange = 0
@@ -92,6 +96,8 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         hostField = NSTextField(string: "")
         hostField.placeholderString = "Tailscale IPv4"
         portField = NSTextField(string: "5901")
+        hostField.delegate = self
+        portField.delegate = self
         passwordField = NSSecureTextField()
         passwordField.placeholderString = "VNC password"
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect(_:)))
@@ -101,6 +107,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         connectButton.font = .systemFont(ofSize: 13, weight: .semibold)
         connectButton.image = NSImage(systemSymbolName: "arrow.up.right", accessibilityDescription: nil)
         connectButton.imagePosition = .imageLeading
+        connectButton.toolTip = "Connect to the address and port shown above."
         connectButton.widthAnchor.constraint(equalToConstant: 124).isActive = true
         connectButton.setContentHuggingPriority(.required, for: .vertical)
         let connection = NSStackView()
@@ -353,14 +360,31 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.makeFirstResponder(passwordField)
     }
 
+    func controlTextDidChange(_ notification: Notification) {
+        guard session == nil, let field = notification.object as? NSTextField,
+              field === hostField || field === portField else { return }
+        // Editing an endpoint leaves recovery mode. Never label a connection
+        // to a changed address/port as a reconnect to the previous host.
+        if connectionState != .finished(.disconnected) {
+            sessionEstablished = false
+            showConnectionState(.finished(.disconnected))
+            showStatus("Address or port changed. Connect will use the current fields.")
+        }
+    }
+
     @objc private func connect(_ sender: Any?) {
         if let session {
             desktop.releaseInput()
             session.stop()
-            connectButton.isEnabled = false
+            ready = false
+            desktop.clearDesktop()
+            updateZoomControls()
+            sendButton.isEnabled = false
+            showStatus("Disconnecting…")
             showConnectionState(.stopping(.disconnected))
             return
         }
+        let recovering = connectionState.finished && connectionState != .finished(.disconnected)
         let target: ConnectionTarget
         var password = passwordField.stringValue
         do {
@@ -373,12 +397,19 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 }
                 password = try ProfilePasswords.read(reference: reference, target: target)
             }
+            if recovering && password.isEmpty {
+                showStatus("Enter the VNC password to \(sessionEstablished ? "reconnect" : "retry") \(target.host):\(target.port). Typed passwords are not retained.")
+                focusConnectionPassword()
+                return
+            }
             guard validVNCPassword(password) else { throw PasswordError.invalidPassword }
         } catch {
             showStatus(error.localizedDescription)
             focusConnectionPassword()
             return
         }
+        ready = false
+        sessionEstablished = false
         desktop.clearDesktop()
         updateZoomControls()
         let session = VNCSession(host: target.host, port: target.port, password: password)
@@ -389,8 +420,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         hostField.isEnabled = false
         portField.isEnabled = false
         passwordField.isEnabled = false
-        connectButton.title = "Disconnect"
-        showStatus("Connecting…")
+        showStatus("Connecting to \(target.host):\(target.port)…")
         showConnectionState(.connecting)
         pasteboardChange = pasteboard.changeCount // Never export the old clipboard on connect.
         updateProfileControls()
@@ -404,24 +434,39 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private func showConnectionState(_ state: SessionState) {
+        connectionState = state
         let title: String
         let symbol: String
         let color: NSColor
+        let action: String
         switch state {
         case .connecting:
-            title = "Connecting"; symbol = "circle.dotted"; color = .secondaryLabelColor
+            title = "Connecting"; symbol = "circle.dotted"; color = .secondaryLabelColor; action = "Disconnect"
         case .connected:
-            title = "Connected"; symbol = "circle.fill"; color = .systemGreen
+            title = "Connected"; symbol = "circle.fill"; color = .systemGreen; action = "Disconnect"
         case .stopping:
-            title = "Disconnecting"; symbol = "circle.dotted"; color = .secondaryLabelColor
+            title = "Disconnecting"; symbol = "circle.dotted"; color = .secondaryLabelColor; action = "Disconnect"
+        case .finished(.disconnected):
+            title = "Not connected"; symbol = "circle"; color = .secondaryLabelColor; action = "Connect"
         case .finished:
-            title = "Not connected"; symbol = "circle"; color = .secondaryLabelColor
+            title = sessionEstablished ? "Connection lost" : "Connection failed"
+            symbol = "exclamationmark.circle"; color = .systemOrange
+            action = sessionEstablished ? "Reconnect" : "Retry"
         }
         connectionStateField.stringValue = title
         connectionStateImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         connectionStateImage.contentTintColor = color
-        connectButton.image = NSImage(systemSymbolName: state.finished ? "arrow.up.right" : "xmark", accessibilityDescription: nil)
+        let recovery = state.finished && state != .finished(.disconnected)
+        connectButton.title = action
+        connectButton.image = NSImage(systemSymbolName: recovery ? "arrow.clockwise" : state.finished ? "arrow.up.right" : "xmark", accessibilityDescription: nil)
         connectButton.bezelColor = state.finished ? .controlAccentColor : nil
+        if case .stopping = state { connectButton.isEnabled = false }
+        else { connectButton.isEnabled = true }
+        if recovery {
+            connectButton.toolTip = "\(action) \(hostField.stringValue):\(portField.stringValue) with the current clipboard setting. Read an endpoint-matched Keychain password, or enter it again. No automatic retries."
+        } else {
+            connectButton.toolTip = state.finished ? "Connect to the address and port shown above." : "Disconnect or cancel this connection."
+        }
     }
 
     private var selectedProfile: ConnectionProfile? {
@@ -452,6 +497,8 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     @objc private func profileChanged(_ sender: Any?) {
         guard session == nil else { return }
+        sessionEstablished = false
+        showConnectionState(.finished(.disconnected))
         let profile = selectedProfile
         hostField.stringValue = profile?.target.host ?? ""
         portField.stringValue = profile.map { String($0.target.port) } ?? "5901"
@@ -578,17 +625,19 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         let update = session.poll()
         let wasReady = ready
         ready = update.state.ready
+        sessionEstablished = update.established
+        if wasReady && !ready { desktop.clearDesktop() }
         desktop.inputEnabled = ready
         if ready && !wasReady {
             pasteboardChange = pasteboard.changeCount
             window.makeFirstResponder(desktop)
         }
-        if ready != wasReady || update.state.finished {
+        if connectionState != update.state {
             showStatus(update.state.message)
             showConnectionState(update.state)
         }
-        if let frame = update.frame { desktop.showFrame(frame) }
-        if let cursor = update.cursor { desktop.showCursor(cursor) }
+        if ready, let frame = update.frame { desktop.showFrame(frame) }
+        if ready, let cursor = update.cursor { desktop.showCursor(cursor) }
         if ready != wasReady || update.frame != nil { updateZoomControls() }
         if let data = update.clipboard, clipboardButton.state == .on, ready,
            let text = String(data: data, encoding: .utf8) {
@@ -617,9 +666,12 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             hostField.isEnabled = true
             portField.isEnabled = true
             passwordField.isEnabled = true
-            connectButton.title = "Connect"
-            connectButton.isEnabled = true
+            pasteboardChange = pasteboard.changeCount
             updateProfileControls()
+            if case .finished(let reason) = update.state, reason != .disconnected {
+                let title = sessionEstablished ? "Connection lost." : "Connection failed."
+                showStatus("\(title) \(reason.message) Use \(connectButton.title) for \(hostField.stringValue):\(portField.stringValue) when ready. Nothing reconnects automatically.")
+            }
             if terminating { NSApp.reply(toApplicationShouldTerminate: true) }
         }
     }
