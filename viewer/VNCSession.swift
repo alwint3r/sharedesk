@@ -56,11 +56,27 @@ enum SessionState: Sendable, Equatable {
     }
 }
 
+enum ClipboardSendStatus {
+    case queued, unsupported, tooLarge, invalid, notReady, queueFull
+    var message: String {
+        switch self {
+        case .queued: "Mac clipboard queued for Ubuntu. Paste there with the application's Ubuntu shortcut."
+        case .unsupported: "Clipboard was not sent: this peer has not negotiated UTF-8. Use Latin-1 text or update the host."
+        case .tooLarge: "Clipboard was not sent: the encoded transfer exceeds 1 MiB (UTF-8 includes its line endings and terminator)."
+        case .invalid: "Clipboard was not sent: text must not contain NUL bytes."
+        case .notReady: "Clipboard was not sent: sharing requires an active, enabled connection."
+        case .queueFull: SessionEnd.queueFull.message
+        }
+    }
+}
+
 struct SessionUpdate: Sendable {
     let state: SessionState
     let frame: PixelFrame?
     let cursor: RemoteCursor?
-    let clipboard: Data?
+    let clipboard: Data? // Canonical UTF-8, including when received through Latin-1.
+    let clipboardUTF8: Bool
+    let clipboardError: String?
 }
 
 // The one unchecked Sendable boundary is audited here: every shared field is
@@ -76,6 +92,9 @@ final class VNCSession: @unchecked Sendable {
     private var cancelSocket: Int32 = -1 // Owned duplicate; shutdown cancels C I/O.
     private var ioDeadline: TimeInterval = 0
     private var clipboardEnabled = false
+    private var clipboardEpoch: UInt64 = 0
+    private var clipboardUTF8 = false
+    private var pendingClipboardError: String?
     private var packets: [Data] = []
     private var queuedBytes = 0
     private var pendingFrame: PixelFrame?
@@ -115,17 +134,32 @@ final class VNCSession: @unchecked Sendable {
         enqueue(packet)
     }
 
-    func sendClipboard(_ text: Data) {
-        guard text.count <= clipboardLimit, !text.contains(0) else { return }
-        var packet = Data([6, 0, 0, 0])
-        withUnsafeBytes(of: UInt32(text.count).bigEndian) { packet.append(contentsOf: $0) }
-        packet.append(text)
-        enqueue(packet)
+    @discardableResult func sendClipboard(_ text: String) -> ClipboardSendStatus {
+        let mode = lock.withLock { (state.ready && stopReason == nil && clipboardEnabled, clipboardUTF8) }
+        guard mode.0 else { return .notReady }
+        guard !text.utf8.contains(0) else { return .invalid }
+        guard text.utf8.count <= 2 * clipboardLimit else { return .tooLarge }
+        let extended = mode.1 ? text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: "\r\n") : ""
+        let data: Data
+        let unicode: Bool
+        if mode.1 && extended.utf8.count < clipboardLimit {
+            data = Data(extended.utf8); unicode = true
+        } else if let latin1 = text.data(using: .isoLatin1, allowLossyConversion: false), latin1.count <= clipboardLimit {
+            data = latin1; unicode = false // Also preserves the full legacy 1 MiB limit.
+        } else { return mode.1 ? .tooLarge : .unsupported }
+        // Byte 3 is an internal queue marker, never sent as wire padding.
+        // The worker compresses UTF-8 only when its ordered turn is reached.
+        var packet = Data([6, 0, 0, unicode ? 1 : 0])
+        withUnsafeBytes(of: UInt32(data.count).bigEndian) { packet.append(contentsOf: $0) }
+        packet.append(data)
+        if enqueue(packet) { return .queued }
+        return lock.withLock { stopReason == .queueFull ? .queueFull : .notReady }
     }
 
-    private func enqueue(_ packet: Data) {
+    @discardableResult private func enqueue(_ packet: Data) -> Bool {
         lock.withLock {
-            guard state.ready, stopReason == nil, packet.first != 6 || clipboardEnabled else { return }
+            guard state.ready, stopReason == nil, packet.first != 6 || clipboardEnabled else { return false }
             // Replace pointer motion, not transitions, wheel impulses, keys or text.
             if packet.count == 6, packet[0] == 5, packet[1] & 0x78 == 0,
                let last = packets.last, last.count == 6, last[0] == 5, last[1] == packet[1] {
@@ -135,17 +169,20 @@ final class VNCSession: @unchecked Sendable {
             guard queuedBytes + packet.count <= 2 << 20, packets.count < 2048 else {
                 stopReason = .queueFull
                 if cancelSocket >= 0 { _ = shutdown(cancelSocket, SHUT_RDWR) }
-                return
+                return false
             }
             packets.append(packet)
             queuedBytes += packet.count
+            return true
         }
     }
 
     func setClipboardSharing(_ enabled: Bool) {
         lock.withLock {
+            if clipboardEnabled != enabled { clipboardEpoch &+= 2 }
             clipboardEnabled = enabled
             pendingClipboard = nil
+            pendingClipboardError = nil
             if !enabled {
                 packets.removeAll { packet in
                     if packet.first == 6 { queuedBytes -= packet.count; return true }
@@ -165,10 +202,12 @@ final class VNCSession: @unchecked Sendable {
                 FileHandle.standardError.write(Data("Sharedesk: network operation exceeded its elapsed-time deadline\n".utf8))
                 if cancelSocket >= 0 { _ = shutdown(cancelSocket, SHUT_RDWR) }
             }
-            let update = SessionUpdate(state: state, frame: pendingFrame, cursor: pendingCursor, clipboard: pendingClipboard)
+            let update = SessionUpdate(state: state, frame: pendingFrame, cursor: pendingCursor, clipboard: pendingClipboard,
+                                       clipboardUTF8: clipboardUTF8, clipboardError: pendingClipboardError)
             pendingFrame = nil
             pendingCursor = nil
             pendingClipboard = nil
+            pendingClipboardError = nil
             return update
         }
     }
@@ -182,7 +221,8 @@ final class VNCSession: @unchecked Sendable {
     }
 
     private func run() {
-        let callbacks = SDVNCCallbacks(frame: receiveFrame, cursor: receiveCursor, clipboard: receiveClipboard)
+        let callbacks = SDVNCCallbacks(frame: receiveFrame, cursor: receiveCursor, clipboard: receiveClipboard,
+                                      clipboard_state: receiveClipboardState)
         let context = Unmanaged.passUnretained(self).toOpaque()
         var connected = false
         if let client = sd_vnc_create(callbacks, context) {
@@ -222,8 +262,29 @@ final class VNCSession: @unchecked Sendable {
                     let skip = lock.withLock { stopReason != nil || (packet.first == 6 && !clipboardEnabled) }
                     if skip { continue }
                     beginIO(timeout: 20)
-                    healthy = packet.withUnsafeBytes { bytes in
-                        sd_vnc_write(client, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                    if packet.first == 6 && packet[3] == 1 {
+                        let text = Data(packet.dropFirst(8))
+                        let result = text.withUnsafeBytes { bytes in
+                            sd_vnc_send_clipboard_utf8(client, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                        }
+                        if result == SDVNC_CLIPBOARD_UNSUPPORTED,
+                           let string = String(data: text, encoding: .utf8),
+                           let latin1 = string.replacingOccurrences(of: "\r\n", with: "\n").data(using: .isoLatin1, allowLossyConversion: false) {
+                            var fallback = Data([6, 0, 0, 0])
+                            withUnsafeBytes(of: UInt32(latin1.count).bigEndian) { fallback.append(contentsOf: $0) }
+                            fallback.append(latin1)
+                            healthy = fallback.withUnsafeBytes { bytes in
+                                sd_vnc_write(client, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                            }
+                        } else if result == SDVNC_CLIPBOARD_FAILED { healthy = false }
+                        else if result != SDVNC_CLIPBOARD_SENT {
+                            lock.withLock { pendingClipboardError = (result == SDVNC_CLIPBOARD_TOO_LARGE ?
+                                ClipboardSendStatus.tooLarge : ClipboardSendStatus.unsupported).message }
+                        }
+                    } else {
+                        healthy = packet.withUnsafeBytes { bytes in
+                            sd_vnc_write(client, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                        }
                     }
                     endIO()
                     if !healthy { break }
@@ -234,6 +295,7 @@ final class VNCSession: @unchecked Sendable {
                 else if ready > 0 {
                     beginIO(timeout: 20)
                     healthy = autoreleasepool { sd_vnc_process_message(client) }
+                    lock.withLock { clipboardUTF8 = sd_vnc_clipboard_utf8(client) }
                     endIO()
                 }
             }
@@ -245,6 +307,8 @@ final class VNCSession: @unchecked Sendable {
         password = nil
         lock.withLock {
             state = .finished(stopReason ?? (connected ? .connectionClosed : .setupFailed))
+            clipboardUTF8 = false
+            pendingClipboardError = nil
             packets = []
             queuedBytes = 0
             pendingFrame = nil
@@ -273,13 +337,17 @@ final class VNCSession: @unchecked Sendable {
         lock.withLock { pendingCursor = cursor }
     }
 
-    fileprivate func acceptClipboard(_ text: UnsafePointer<CChar>?, length: Int) {
-        guard length >= 0, length <= clipboardLimit, length == 0 || text != nil else { return }
-        lock.withLock {
-            guard clipboardEnabled else { return }
-            let data = length == 0 ? Data() : Data(bytes: text!, count: length)
-            if !data.contains(0) { pendingClipboard = data }
-        }
+    fileprivate var clipboardState: UInt64 {
+        lock.withLock { clipboardEpoch | (clipboardEnabled && state.ready && stopReason == nil ? 1 : 0) }
+    }
+
+    fileprivate func acceptClipboard(_ text: UnsafePointer<CChar>?, length: Int, utf8: Bool) {
+        guard length >= 0, length <= clipboardLimit, length == 0 || text != nil,
+              lock.withLock({ clipboardEnabled }) else { return }
+        let data = length == 0 ? Data() : Data(bytes: text!, count: length)
+        guard !data.contains(0), let string = String(data: data, encoding: utf8 ? .utf8 : .isoLatin1) else { return }
+        let canonical = Data((utf8 ? string.replacingOccurrences(of: "\r\n", with: "\n") : string).utf8)
+        lock.withLock { if clipboardEnabled { pendingClipboard = canonical } }
     }
 }
 
@@ -293,7 +361,11 @@ private func receiveCursor(_ context: UnsafeMutableRawPointer?, _ pixels: Unsafe
     guard let context, let pixels, let mask else { return }
     Unmanaged<VNCSession>.fromOpaque(context).takeUnretainedValue().acceptCursor(pixels, mask: mask, width: Int(width), height: Int(height), hotX: Int(hotX), hotY: Int(hotY))
 }
-private func receiveClipboard(_ context: UnsafeMutableRawPointer?, _ text: UnsafePointer<CChar>?, _ length: Int32) {
+private func receiveClipboard(_ context: UnsafeMutableRawPointer?, _ text: UnsafePointer<CChar>?, _ length: Int32, _ utf8: Bool) {
     guard let context else { return }
-    Unmanaged<VNCSession>.fromOpaque(context).takeUnretainedValue().acceptClipboard(text, length: Int(length))
+    Unmanaged<VNCSession>.fromOpaque(context).takeUnretainedValue().acceptClipboard(text, length: Int(length), utf8: utf8)
+}
+private func receiveClipboardState(_ context: UnsafeMutableRawPointer?) -> UInt64 {
+    guard let context else { return 0 }
+    return Unmanaged<VNCSession>.fromOpaque(context).takeUnretainedValue().clipboardState
 }

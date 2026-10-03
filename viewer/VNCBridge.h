@@ -16,7 +16,11 @@ typedef struct {
     void (*frame)(void *context, const uint8_t *pixels, int width, int height);
     void (*cursor)(void *context, const uint8_t *pixels, const uint8_t *mask,
                    int width, int height, int hot_x, int hot_y);
-    void (*clipboard)(void *context, const char *text, int length);
+    /* Text excludes the protocol terminator. utf8=false means ISO-8859-1. */
+    void (*clipboard)(void *context, const char *text, int length, bool utf8);
+    /* Swift owns opt-in policy. Bit 0 enables sharing; other bits are an
+     * epoch changed on every toggle, invalidating retained protocol offers. */
+    uint64_t (*clipboard_state)(void *context);
 } SDVNCCallbacks;
 
 /* The worker owns the handle. No function starts a thread or schedules work.
@@ -35,5 +39,14 @@ bool sd_vnc_initialize_framebuffer(SDVNCClient *client);
 int sd_vnc_wait(SDVNCClient *client, unsigned int timeout_microseconds);
 bool sd_vnc_process_message(SDVNCClient *client);
 bool sd_vnc_write(SDVNCClient *client, const uint8_t *packet, size_t length);
+bool sd_vnc_clipboard_utf8(SDVNCClient *client); /* Negotiated text/provide support. */
+typedef enum {
+    SDVNC_CLIPBOARD_SENT, SDVNC_CLIPBOARD_UNSUPPORTED,
+    SDVNC_CLIPBOARD_TOO_LARGE, SDVNC_CLIPBOARD_FAILED
+} SDVNCClipboardResult;
+/* UTF-8 is CRLF-normalized, without its protocol NUL; the worker borrows it
+ * for this call. A protocol offer is retained only until replacement/toggle
+ * or destruction. This may block on writes under the caller's I/O deadline. */
+SDVNCClipboardResult sd_vnc_send_clipboard_utf8(SDVNCClient *client, const uint8_t *text, size_t length);
 
 #endif

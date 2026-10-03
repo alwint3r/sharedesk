@@ -1,0 +1,55 @@
+--- a/src/libvncserver/rfbserver.c
++++ b/src/libvncserver/rfbserver.c
+@@ -2132,6 +2132,8 @@
+ 
+ static int
+ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char *data, int len) {
++    /* Sharedesk: bounded text-only clipboard decoder. */
++    if (flags != (rfbExtendedClipboard_Provide | rfbExtendedClipboard_Text)) return TRUE;
+     int i;
+     uint32_t size;
+     char *buf = NULL;
+@@ -2147,7 +2149,7 @@
+         return FALSE;
+     }
+     stream.avail_in = len;
+-    stream.next_in = data;
++    stream.next_in = (unsigned char *)data;
+     for (i = 0; i < 16; i++) {
+         if (!(flags & (1 << i))) {
+             continue;
+@@ -2155,7 +2157,7 @@
+         stream.avail_out = 4;
+         stream.next_out = (unsigned char *)&size;
+         int err = inflate(&stream, Z_NO_FLUSH);
+-        if (err != Z_OK) {
++        if (err != Z_OK || stream.total_out != 4) {
+             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
+             if (buf != NULL) {
+                 free(buf);
+@@ -2185,13 +2187,24 @@
+         stream.avail_out = size;
+         stream.next_out = (unsigned char *)buf;
+         err = inflate(&stream, Z_NO_FLUSH);
+-        if (err != Z_OK && err != Z_STREAM_END) {
++        if ((err != Z_OK && err != Z_STREAM_END) || stream.total_out != 4 + size) {
+             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
+             free(buf);
+             inflateEnd(&stream);
+             rfbCloseClient(cl);
+             return FALSE;
+         }
++        unsigned char extra;
++        stream.next_out = &extra;
++        stream.avail_out = 1;
++        err = inflate(&stream, Z_NO_FLUSH);
++        if (stream.total_out != 4 + size || stream.avail_in != 0 ||
++            (err != Z_OK && err != Z_STREAM_END && err != Z_BUF_ERROR)) {
++            free(buf);
++            inflateEnd(&stream);
++            rfbCloseClient(cl);
++            return FALSE;
++        }
+         if (i == 0) {
+             /* text */
+             if (!cl->viewOnly && cl->screen->setXCutTextUTF8) {

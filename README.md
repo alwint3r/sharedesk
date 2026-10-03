@@ -12,6 +12,8 @@ README.md                     # Shared build and usage documentation
 host/
   CMakeLists.txt               # Host target and dependencies
   host.c
+  libvncserver-clipboard.patch # Unified safety patch for the private dependency
+  patch-vnc-clipboard.cmake    # Apply/check the pinned dependency patch
   scripts/install-autostart.py
 viewer/
   CMakeLists.txt               # Viewer target and dependencies
@@ -22,7 +24,7 @@ viewer/
   ConnectionProfiles.swift    # Validated profile settings and private file storage
   ProfileEditor.swift         # Native Add/Edit dialog
   ProfilePasswords.swift      # Optional macOS Keychain credentials
-  VNCBridge.c                 # LibVNCClient callbacks and buffer ownership
+  VNCBridge.c                 # LibVNCClient interop, bounded clipboard codec and buffers
   VNCBridge.h
   module.modulemap            # Swift import of the C bridge
   viewer-Info.plist.in
@@ -39,10 +41,14 @@ Run the commands below from the repository root. The application folders own the
 Install build dependencies:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libvncserver-dev libx11-dev libxtst-dev libxfixes-dev libxext-dev libxdamage-dev
+sudo apt install build-essential cmake pkg-config patch zlib1g-dev libjpeg-dev libpng-dev libx11-dev libxtst-dev libxfixes-dev libxext-dev libxdamage-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+The first configuration downloads a SHA-256-pinned **LibVNCServer 0.9.15** source archive. Ubuntu 22.04's system 0.9.13 has no Unicode clipboard extension. CMake applies `host/libvncserver-clipboard.patch` to validate compressed text lengths, then links the private server library statically into `build/sharedesk-host`. Ubuntu's system VNC library is not replaced, and the autostart installer still copies a single host executable. Compression/image libraries and X11 remain system dependencies. Examples, tests, background-thread support, TLS, WebSockets and file-transfer extensions are disabled in this private library; Tailscale remains the transport security boundary.
+
+For an offline build, provide a writable extracted copy of the pinned 0.9.15 source with `-DFETCHCONTENT_SOURCE_DIR_SHAREDESK_VNC=/path/to/source` on the configure command. The same unified patch is checked and applied there. The private library is GPL-2.0-or-later; review its license and corresponding-source obligations before distributing host binaries.
 
 Build from this directory on Ubuntu, inside or outside the desktop session. The same C source also builds for Linux x86-64 and ARM64 with the corresponding Linux libraries; it is not a macOS host.
 
@@ -105,9 +111,9 @@ When zoomed, drag the local horizontal/vertical scrollbars to navigate the enlar
 
 Keyboard input initially targets English (US) direct keys, including Shift punctuation, navigation, F1–F12 and shortcuts. **Control maps to Ubuntu Ctrl, Option to Alt, and Command to Super**, not Ctrl. Cmd+Q and Cmd+W stay local. Key-up uses the remembered key-down symbol; Mac repeat events are ignored because the host owns repeat. Losing focus releases held input. IME composition and dead-key text entry are not supported yet.
 
-For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard (Latin-1)** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
+For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
 
-Clipboard sharing is off by default in both programs. The viewer rejects unrepresentable Unicode, NUL-containing text and text over 1 MiB without shortening it. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
+Clipboard sharing is off by default in both programs. UTF-8 is negotiated when both sides support the standard Extended Clipboard extension. Older peers retain lossless Latin-1 sharing; unsupported Unicode is rejected with a status message. The checkbox tooltip shows whether UTF-8 was negotiated. NUL-containing text and transfers over the encoded byte limit are rejected without shortening them. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
 
 ### Connection profiles
 
@@ -121,7 +127,7 @@ Disable **Remember password** in the editor to remove its Keychain item. **Delet
 
 Settings live in `~/.sharedesk/profiles.json` on the Mac, with permission 600 inside a directory with permission 700. The JSON contains settings and optional credential references, never passwords. Writes replace the file atomically. Invalid, unreadable, oversized or externally changed files are not silently overwritten. Manual connections remain available if saved profiles cannot be loaded. Reopen the viewer after resolving a file error to reload its profiles.
 
-A profile can remember that clipboard sharing is enabled, but neither selecting it nor connecting sends an old clipboard snapshot. Clipboard privacy and Latin-1 limits remain unchanged.
+A profile can remember that clipboard sharing is enabled, but neither selecting it nor connecting sends an old clipboard snapshot. Clipboard privacy and opt-in behaviour remain unchanged; encoding is negotiated per connection.
 
 ### Regenerate the viewer icon
 
@@ -215,7 +221,11 @@ Only Ubuntu's **CLIPBOARD** selection (normal Copy/Paste) is shared. Selecting t
 
 **Privacy:** enabled clipboard sharing is automatic and can transfer passwords or other sensitive text. Sharedesk keeps its clipboard buffers in memory and does not write their contents to logs or files. Other applications or clipboard managers may store shared text. To disable sharing, reinstall without `--clipboard` and restart the host. Preserve your other options, such as `--fps 30 --stats`.
 
-Ubuntu 22.04's standard VNC clipboard protocol uses **Latin-1**, not full Unicode. ASCII, multiline text and Latin-1 characters such as `é` and `£` are supported, up to **1 MiB** of VNC text. X11 UTF-8 text is converted only when it fits Latin-1. Other Unicode text, embedded NUL bytes and oversized Ubuntu copies are ignored rather than corrupted or shortened. LibVNCServer disconnects a viewer that sends a clipboard message larger than 1 MiB; the listener remains available for reconnection. Images, files and formatted clipboard data are not transferred. Large incremental X11 reads are bounded and time out after two seconds; an unavailable clipboard owner does not stop desktop sharing.
+Updated Sharedesk hosts and viewers negotiate the standard **Extended Clipboard** extension for full **UTF-8** text, including curly quotes, non-Latin scripts, combining characters and emoji. The extension uses CRLF line endings and a terminating NUL on the wire; local UTF-8 imports use LF. The limit is **1 MiB per encoded text format**, including those line endings and the terminator, so UTF-8 content has at most 1 MiB minus one byte. Compressed message buffers and inflated data are both bounded.
+
+Classic peers still use **Latin-1**, up to the original **1 MiB** of text. Sharedesk can use that lossless path even on a Unicode-capable connection if a Latin-1 copy's UTF-8 form is too large. It never guesses UTF-8 in a classic message or replaces unsupported characters. An older host must be rebuilt and its installed copy updated for full Unicode; updating only the viewer retains Latin-1 compatibility.
+
+Invalid UTF-8, embedded NUL bytes, missing extended terminators and unsupported/oversized local copies are rejected rather than corrupted or shortened. Malformed compressed data or oversized wire headers can disconnect the offending peer; the host listener remains available. Images, files and formatted clipboard data are not transferred. Large incremental X11 reads are bounded and time out after two seconds; an unavailable clipboard owner does not stop desktop sharing. Only the latest offered text is retained when needed to answer protocol requests; disabling viewer sharing clears that offer, and connection cleanup frees it. Capability negotiation and re-enabling sharing do not export an old local copy.
 
 For missing clipboard transfers, `--stats` reports the running host's `clipboard=on/off` setting plus content-free counters. During the five-second window containing a Mac copy, `clip_rx=0` means no authenticated standard clipboard message reached the host callback. A positive `clip_rx` with `clip_imports=0` means the message was received but not accepted for import (for example, sharing is off or the text was rejected). Positive `clip_imports` counts accepted X11 ownership requests, not confirmation that a particular application pasted the text. In Ubuntu Terminal, paste with **Ctrl+Shift+V** or right-click → **Paste**, not macOS Cmd+V.
 

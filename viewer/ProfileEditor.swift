@@ -18,7 +18,7 @@ final class ProfileEditor: NSObject {
         hostField = NSTextField(string: profile?.target.host ?? host)
         hostField.placeholderString = "Tailscale IPv4"
         portField = NSTextField(string: profile.map { String($0.target.port) } ?? port)
-        clipboardButton = NSButton(checkboxWithTitle: "Share text clipboard (Latin-1)", target: nil, action: nil)
+        clipboardButton = NSButton(checkboxWithTitle: "Share text clipboard", target: nil, action: nil)
         clipboardButton.state = (profile?.shareClipboard ?? shareClipboard) ? .on : .off
         rememberButton = NSButton(checkboxWithTitle: "Remember password in macOS Keychain", target: nil, action: nil)
         rememberButton.state = profile?.passwordReference != nil ? .on : .off

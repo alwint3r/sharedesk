@@ -45,8 +45,8 @@ typedef struct {
     uint64_t clipboard_sent;
 } Stats;
 
-#define CLIPBOARD_LIMIT (1U << 20) /* Standard LibVNCServer cut-text limit. */
-#define CLIPBOARD_X_LIMIT (2U * CLIPBOARD_LIMIT) /* Latin-1 expanded to UTF-8. */
+#define CLIPBOARD_LIMIT (1U << 20) /* Library wire and inflated format limit. */
+#define CLIPBOARD_X_LIMIT (2U * CLIPBOARD_LIMIT) /* Preserve 1 MiB Latin-1 fallback. */
 
 typedef struct {
     int enabled;
@@ -55,9 +55,9 @@ typedef struct {
     Atom selection, utf8, targets, timestamp, incr, property;
     Time owned_at;
     unsigned long owned_after; /* Ignore notifications queued before a newer import. */
-    char *text; /* Owned Latin-1 selection contents, freed on ownership loss. */
+    char *text; /* Owned UTF-8 selection contents, freed on ownership loss. */
     size_t text_length;
-    char *wire_text; /* Per-connection echo suppression, not a clipboard log. */
+    char *wire_text; /* Canonical UTF-8 echo suppression, not a clipboard log. */
     size_t wire_length;
     Window reader; /* A fresh requestor isolates each asynchronous transfer. */
     Time requested_at;
@@ -214,41 +214,135 @@ static void reset_clipboard_connection(Host *host) {
     host->clipboard.wire_length = 0;
 }
 
-static void clipboard_from_viewer(char *text, int length, rfbClientPtr client) {
+/* Decode one Unicode scalar. Reject overlong forms, surrogates and values
+ * beyond U+10FFFF. Callers also reject NUL, since only plain text is shared. */
+static size_t clipboard_scalar(const unsigned char *text, size_t length, uint32_t *scalar) {
+    if (!length) return 0;
+    unsigned char c = text[0];
+    size_t count = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 :
+        c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    if (!count || count > length) return 0;
+    uint32_t value = c & (count == 1 ? 0x7f : count == 2 ? 0x1f : count == 3 ? 0x0f : 0x07);
+    for (size_t i = 1; i < count; ++i) {
+        if ((text[i] & 0xc0) != 0x80) return 0;
+        value = (value << 6) | (text[i] & 0x3f);
+    }
+    if (!value || (count == 2 && value < 0x80) || (count == 3 && value < 0x800) ||
+        (count == 4 && value < 0x10000) || (value >= 0xd800 && value <= 0xdfff) || value > 0x10ffff) return 0;
+    *scalar = value;
+    return count;
+}
+
+static int clipboard_utf8_valid(const char *text, size_t length) {
+    for (size_t i = 0; i < length;) {
+        uint32_t value;
+        size_t count = clipboard_scalar((const unsigned char *)text + i, length - i, &value);
+        if (!count) return 0;
+        i += count;
+    }
+    return 1;
+}
+
+static char *clipboard_utf8_from_latin1(const char *text, size_t length, size_t *utf8_length) {
+    if (length > CLIPBOARD_LIMIT || (length && memchr(text, 0, length))) return NULL;
+    char *converted = malloc(length * 2 + 1);
+    if (!converted) return NULL;
+    size_t count = 0;
+    for (size_t i = 0; i < length; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 128) converted[count++] = (char)(0xc0 | (c >> 6));
+        converted[count++] = c < 128 ? (char)c : (char)(0x80 | (c & 63));
+    }
+    converted[count] = 0;
+    *utf8_length = count;
+    return converted;
+}
+
+static char *clipboard_latin1(const char *text, size_t length, size_t *latin1_length) {
+    char *converted = malloc(length + 1);
+    if (!converted) return NULL;
+    size_t count = 0;
+    for (size_t i = 0; i < length;) {
+        uint32_t value;
+        size_t used = clipboard_scalar((const unsigned char *)text + i, length - i, &value);
+        if (!used || value > 255 || count == CLIPBOARD_LIMIT) { free(converted); return NULL; }
+        converted[count++] = (char)value;
+        i += used;
+    }
+    converted[count] = 0;
+    *latin1_length = count;
+    return converted;
+}
+
+static void clear_clipboard_offer(Host *host) {
+    /* Requests must not retrieve an older exported copy after ownership or
+     * content changes. LibVNCServer owns this per-client protocol cache. */
+    if (host->client) {
+        free(host->client->extClipboardData);
+        host->client->extClipboardData = NULL;
+        host->client->extClipboardDataSize = 0;
+    }
+}
+
+static void clipboard_import(char *text, int length, rfbClientPtr client, int utf8) {
     Host *host = client->screen->screenData;
     Clipboard *clip = &host->clipboard;
     if (client != host->client || client->state != RFB_NORMAL || client->sock == RFB_INVALID_SOCKET) return;
     /* Count authenticated standard messages even when clipboard sharing is
      * off. This distinguishes viewer silence from a disabled/rejecting host. */
     if (host->stats.enabled) ++host->stats.clipboard_received;
+    if (utf8) {
+        /* The extended format includes exactly one required terminating NUL. */
+        if (length < 1 || !text || text[length - 1] != 0) return;
+        --length;
+    }
     if (!clip->enabled || length < 0 || (unsigned int)length > CLIPBOARD_LIMIT ||
-        (length && memchr(text, '\0', (size_t)length))) return;
+        (length && (!text || memchr(text, '\0', (size_t)length))) ||
+        (utf8 && !clipboard_utf8_valid(text, (size_t)length))) return;
     if (!clip->active) {
         process_x_events(host); /* Discard selection changes from before authentication. */
         clip->active = 1;
     }
-    char *owned = malloc((size_t)length + 1), *wire = malloc((size_t)length + 1);
+    size_t count = (size_t)length;
+    char *owned = utf8 ? malloc(count + 1) : clipboard_utf8_from_latin1(text, count, &count);
+    if (owned && utf8) {
+        /* Extended Clipboard uses CRLF; X11 applications use LF. */
+        count = 0;
+        for (int i = 0; i < length; ++i) {
+            if (text[i] == '\r' && i + 1 < length && text[i + 1] == '\n') continue;
+            owned[count++] = text[i];
+        }
+        owned[count] = 0;
+    }
+    char *wire = owned ? malloc(count + 1) : NULL;
     if (!owned || !wire) {
         free(owned);
         free(wire);
         fprintf(stderr, "Clipboard import unavailable: allocation failed\n");
         return;
     }
-    memcpy(owned, text, (size_t)length);
-    memcpy(wire, text, (size_t)length);
-    owned[length] = wire[length] = '\0';
+    memcpy(wire, owned, count + 1);
     cancel_clipboard_read(host);
+    clear_clipboard_offer(host);
     free(clip->text);
     free(clip->wire_text);
     clip->text = owned;
-    clip->text_length = (size_t)length;
+    clip->text_length = count;
     clip->wire_text = wire;
-    clip->wire_length = (size_t)length;
+    clip->wire_length = count;
     clip->owned_at = CurrentTime;
     clip->owned_after = NextRequest(host->display);
     XSetSelectionOwner(host->display, clip->selection, clip->window, CurrentTime);
     if (host->stats.enabled) ++host->stats.clipboard_imports;
     XFlush(host->display);
+}
+
+static void clipboard_from_viewer(char *text, int length, rfbClientPtr client) {
+    clipboard_import(text, length, client, 0);
+}
+
+static void clipboard_from_viewer_utf8(char *text, int length, rfbClientPtr client) {
+    clipboard_import(text, length, client, 1);
 }
 
 static void clipboard_event(Host *host, XEvent *event) {
@@ -266,6 +360,7 @@ static void clipboard_event(Host *host, XEvent *event) {
         clip->text = NULL;
         clip->text_length = 0;
         cancel_clipboard_read(host);
+        clear_clipboard_offer(host);
         if (!clip->active || !host->client || host->client->state != RFB_NORMAL ||
             host->client->sock == RFB_INVALID_SOCKET || selection->owner == None) return;
         clip->reader = XCreateSimpleWindow(host->display, host->root, 0, 0, 1, 1, 0, 0, 0);
@@ -298,7 +393,7 @@ static void clipboard_event(Host *host, XEvent *event) {
         unsigned char *converted = NULL;
         const unsigned char *data = (const unsigned char *)clip->text;
         size_t length = clip->text_length;
-        Atom type = XA_STRING;
+        Atom type = clip->utf8;
         int format = 8;
         Atom offered[] = {clip->targets, clip->timestamp, clip->utf8, XA_STRING};
         unsigned long timestamp = clip->owned_at;
@@ -306,8 +401,10 @@ static void clipboard_event(Host *host, XEvent *event) {
             (request->time == CurrentTime || clip->owned_at == CurrentTime ||
              (int32_t)(request->time - clip->owned_at) >= 0);
         if (request->target == clip->targets) {
+            size_t latin1_length = 0;
+            if (valid) converted = (unsigned char *)clipboard_latin1(clip->text, clip->text_length, &latin1_length);
             data = (const unsigned char *)offered;
-            length = sizeof offered / sizeof offered[0];
+            length = converted ? 4 : 3;
             type = XA_ATOM;
             format = 32;
         } else if (request->target == clip->timestamp) {
@@ -315,21 +412,12 @@ static void clipboard_event(Host *host, XEvent *event) {
             length = 1;
             type = XA_INTEGER;
             format = 32;
-        } else if (request->target == clip->utf8 && valid) {
-            converted = malloc(length * 2 + 1);
+        } else if (request->target == XA_STRING && valid) {
+            converted = (unsigned char *)clipboard_latin1(clip->text, length, &length);
             if (!converted) valid = 0;
-            else {
-                size_t count = 0;
-                for (size_t i = 0; i < length; ++i) {
-                    unsigned char c = data[i];
-                    if (c >= 128) converted[count++] = (unsigned char)(0xc0 | (c >> 6));
-                    converted[count++] = c < 128 ? c : (unsigned char)(0x80 | (c & 63));
-                }
-                data = converted;
-                length = count;
-                type = clip->utf8;
-            }
-        } else if (request->target != XA_STRING) valid = 0;
+            data = converted;
+            type = XA_STRING;
+        } else if (request->target != clip->utf8) valid = 0;
         if (length > clip->max_property_bytes / (size_t)(format / 8)) valid = 0;
         XSync(host->display, False);
         clipboard_reply_window = request->requestor;
@@ -417,40 +505,65 @@ static void clipboard_event(Host *host, XEvent *event) {
     XFree(value);
     XFlush(host->display);
     if (clip->incremental && length) return;
-    /* Standard RFB cut text is Latin-1, not UTF-8. Refuse unrepresentable text
-     * rather than corrupting Unicode or silently replacing characters. */
-    size_t count = 0;
-    for (size_t i = 0; i < clip->received_length; ++i) {
-        unsigned char c = clip->received[i];
-        if (!c) { valid = 0; break; }
-        if (type == clip->utf8 && c >= 128) {
-            if ((c != 0xc2 && c != 0xc3) || i + 1 >= clip->received_length ||
-                (clip->received[i + 1] & 0xc0) != 0x80) { valid = 0; break; }
-            c = (unsigned char)(((c & 3) << 6) | (clip->received[++i] & 63));
+    size_t count = clip->received_length;
+    char *utf8 = NULL;
+    if (type == XA_STRING) utf8 = clipboard_utf8_from_latin1((char *)clip->received, count, &count);
+    else if (clipboard_utf8_valid((char *)clip->received, count)) {
+        utf8 = malloc(count + 1);
+        if (utf8) {
+            if (count) memcpy(utf8, clip->received, count);
+            utf8[count] = 0;
         }
-        clip->received[count++] = c;
     }
-    if (count > CLIPBOARD_LIMIT) valid = 0;
+    size_t latin1_length = 0;
+    char *latin1 = utf8 ? clipboard_latin1(utf8, count, &latin1_length) : NULL;
+    char *extended = NULL;
+    size_t extended_length = 0;
+    if (utf8 && count < CLIPBOARD_LIMIT && host->client && host->client->enableExtendedClipboard) {
+        extended = malloc(CLIPBOARD_LIMIT);
+        if (extended) {
+            /* Extended text uses CRLF and reserves one byte for the required
+             * NUL. Fall back to Latin-1 if its UTF-8 form does not fit. */
+            for (size_t i = 0; i < count; ++i) {
+                char c = utf8[i];
+                if (c == '\r' && i + 1 < count && utf8[i + 1] == '\n') continue;
+                if (extended_length + (c == '\n' ? 2U : 1U) >= CLIPBOARD_LIMIT) {
+                    free(extended); extended = NULL; break;
+                }
+                if (c == '\n') extended[extended_length++] = '\r';
+                extended[extended_length++] = c;
+            }
+            if (extended) {
+                extended[extended_length] = 0;
+                size_t normalized = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    if (utf8[i] == '\r' && i + 1 < count && utf8[i + 1] == '\n') continue;
+                    utf8[normalized++] = utf8[i];
+                }
+                count = normalized;
+                utf8[count] = 0;
+            }
+        }
+    }
+    valid = utf8 && (extended || latin1);
     if (valid && clip->active && host->client && host->client->state == RFB_NORMAL &&
         host->client->sock != RFB_INVALID_SOCKET &&
-        (!clip->wire_text || clip->wire_length != count ||
-         (count && memcmp(clip->wire_text, clip->received, count)))) {
-        char *wire = malloc(count + 1);
-        if (wire) {
-            if (count) memcpy(wire, clip->received, count);
-            wire[count] = '\0';
-            free(clip->wire_text);
-            clip->wire_text = wire;
-            clip->wire_length = count;
-            /* Clipboard writes are synchronous in LibVNCServer. Bound a slow
-             * viewer's wait; the existing capture/input loop owns all work. */
-            int previous_wait = host->screen->maxClientWait;
-            host->screen->maxClientWait = 1000;
-            if (host->stats.enabled) ++host->stats.clipboard_sent;
-            rfbSendServerCutText(host->screen, wire, (int)count);
-            host->screen->maxClientWait = previous_wait;
-        }
-    } else if (!valid) fprintf(stderr, "Clipboard export ignored: text is not Latin-1 or exceeds 1 MiB\n");
+        (!clip->wire_text || clip->wire_length != count || (count && memcmp(clip->wire_text, utf8, count)))) {
+        free(clip->wire_text);
+        clip->wire_text = utf8;
+        clip->wire_length = count;
+        utf8 = NULL;
+        /* Keep the foreground capture/input loop responsive to slow viewers. */
+        int previous_wait = host->screen->maxClientWait;
+        host->screen->maxClientWait = 1000;
+        if (host->stats.enabled) ++host->stats.clipboard_sent;
+        if (extended) rfbSendServerCutTextUTF8(host->screen, extended, (int)extended_length, NULL, 0);
+        else rfbSendServerCutText(host->screen, latin1, (int)latin1_length);
+        host->screen->maxClientWait = previous_wait;
+    } else if (!valid) fprintf(stderr, "Clipboard export ignored: invalid text, unsupported Unicode or transfer limit exceeded\n");
+    free(utf8);
+    free(latin1);
+    free(extended);
     cancel_clipboard_read(host);
 }
 
@@ -1546,7 +1659,8 @@ int main(int argc, char **argv) {
                 XFixesSelectSelectionInput(host.display, clip->window, clip->selection,
                     XFixesSetSelectionOwnerNotifyMask | XFixesSelectionWindowDestroyNotifyMask |
                     XFixesSelectionClientCloseNotifyMask);
-                fprintf(stderr, "Text clipboard sharing enabled (Latin-1, up to 1 MiB)\n");
+                host.screen->setXCutTextUTF8 = clipboard_from_viewer_utf8;
+                fprintf(stderr, "Text clipboard sharing enabled (negotiated UTF-8, Latin-1 fallback; up to 1 MiB)\n");
             }
         }
         if (!clip->enabled) fprintf(stderr, "Clipboard initialization failed; desktop sharing remains available\n");

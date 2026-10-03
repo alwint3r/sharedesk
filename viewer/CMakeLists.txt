@@ -3,6 +3,7 @@ if(NOT CMAKE_GENERATOR MATCHES "^(Ninja|Ninja Multi-Config|Xcode)$")
 endif()
 enable_language(Swift)
 find_package(PkgConfig REQUIRED)
+find_package(ZLIB REQUIRED)
 pkg_check_modules(VNC_CLIENT REQUIRED IMPORTED_TARGET libvncclient>=0.9.15)
 find_library(COCOA_FRAMEWORK Cocoa)
 find_library(CARBON_FRAMEWORK Carbon)
@@ -14,7 +15,7 @@ add_executable(sharedesk-viewer MACOSX_BUNDLE
     ConnectionProfiles.swift ProfilePasswords.swift ProfileEditor.swift VNCBridge.c sharedesk-viewer.icns)
 target_include_directories(sharedesk-viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(sharedesk-viewer PRIVATE "$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Wpedantic>")
-target_link_libraries(sharedesk-viewer PRIVATE PkgConfig::VNC_CLIENT ${COCOA_FRAMEWORK} ${CARBON_FRAMEWORK} ${SECURITY_FRAMEWORK})
+target_link_libraries(sharedesk-viewer PRIVATE PkgConfig::VNC_CLIENT ZLIB::ZLIB ${COCOA_FRAMEWORK} ${CARBON_FRAMEWORK} ${SECURITY_FRAMEWORK})
 set_target_properties(sharedesk-viewer PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES

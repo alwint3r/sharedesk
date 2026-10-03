@@ -142,14 +142,14 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         passwordField.widthAnchor.constraint(equalToConstant: 210).isActive = true
         connection.addArrangedSubview(connectButton)
 
-        clipboardButton = NSButton(checkboxWithTitle: "Share text clipboard (Latin-1)", target: self, action: #selector(clipboardChanged(_:)))
+        clipboardButton = NSButton(checkboxWithTitle: "Share text clipboard", target: self, action: #selector(clipboardChanged(_:)))
         clipboardButton.font = .systemFont(ofSize: 12)
         clipboardButton.toolTip = "Opt-in, two-way text sharing. The Ubuntu host must also enable clipboard sharing."
         sendButton = NSButton(title: "Send Clipboard", target: self, action: #selector(sendClipboard(_:)))
         sendButton.bezelStyle = .glass
         sendButton.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: nil)
         sendButton.imagePosition = .imageLeading
-        sendButton.toolTip = "Send text already on the Mac clipboard. Latin-1 only, up to 1 MiB."
+        sendButton.toolTip = "Send text already on the Mac clipboard. Negotiated UTF-8 or Latin-1 fallback, up to 1 MiB per encoded transfer."
         sendButton.isEnabled = false
         let options = NSStackView(views: [clipboardButton, sendButton])
         options.orientation = .horizontal
@@ -569,13 +569,8 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             if force { showStatus("No text is available on the Mac clipboard.") }
             return
         }
-        guard let data = text.data(using: .isoLatin1, allowLossyConversion: false),
-              data.count <= clipboardLimit, !data.contains(0) else {
-            showStatus("Clipboard was not sent: use Latin-1 text up to 1 MiB, without NUL bytes.")
-            return
-        }
-        session?.sendClipboard(data)
-        showStatus("Mac clipboard queued for Ubuntu. Paste there with the application's Ubuntu shortcut.")
+        guard let session else { return }
+        showStatus(session.sendClipboard(text).message)
     }
 
     @objc private func poll(_ timer: Timer) {
@@ -596,12 +591,16 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if let cursor = update.cursor { desktop.showCursor(cursor) }
         if ready != wasReady || update.frame != nil { updateZoomControls() }
         if let data = update.clipboard, clipboardButton.state == .on, ready,
-           let text = String(data: data, encoding: .isoLatin1) {
+           let text = String(data: data, encoding: .utf8) {
             pasteboard.clearContents()
             let written = pasteboard.setString(text, forType: .string)
             pasteboardChange = pasteboard.changeCount // Suppress our own echo.
             showStatus(written ? "Ubuntu text received on the Mac clipboard." : "Could not write the received text to the Mac clipboard.")
         }
+        if let error = update.clipboardError { showStatus(error) }
+        clipboardButton.toolTip = update.clipboardUTF8 ?
+            "UTF-8 clipboard support negotiated. Both sides must enable sharing; text transfers are limited to 1 MiB." :
+            "Opt-in, two-way text sharing. This peer has not negotiated UTF-8; Latin-1 fallback only. The host must also enable sharing."
         sendButton.isEnabled = ready && clipboardButton.state == .on
         let now = ProcessInfo.processInfo.systemUptime
         if ready && NSApp.isActive && now >= nextClipboardPoll {
