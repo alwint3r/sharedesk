@@ -21,6 +21,7 @@ viewer/
   ViewerApplication.swift     # Window, controls and main-thread clipboard
   DesktopView.swift           # Rendering, cursor and input
   VNCSession.swift            # Worker, session state, queues and deadlines
+  ConnectionStatistics.swift  # On-demand, content-free session statistics panel
   ConnectionProfiles.swift    # Validated profile settings and private file storage
   ProfileEditor.swift         # Native Add/Edit dialog
   ProfilePasswords.swift      # Optional macOS Keychain credentials
@@ -120,6 +121,25 @@ Keyboard input initially targets English (US) direct keys, including Shift punct
 For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
 
 Clipboard sharing is off by default in both programs. UTF-8 is negotiated when both sides support the standard Extended Clipboard extension. Older peers retain lossless Latin-1 sharing; unsupported Unicode is rejected with a status message. The checkbox tooltip shows whether UTF-8 was negotiated. NUL-containing text and transfers over the encoded byte limit are rejected without shortening them. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
+
+### Viewer connection statistics
+
+Click **Stats** in the footer to open the non-modal **Connection Statistics** window. It is available with the top controls shown or hidden, and starts closed each launch. Opening it releases held remote keys/buttons but does not pause the connection. Closing it stops statistics sampling without disconnecting.
+
+The panel refreshes about once per second using the existing UI timer. It shows:
+
+| Field | Meaning |
+| --- | --- |
+| Remote resolution | The most recently reported framebuffer dimensions in remote pixels, independent of local zoom. |
+| Received updates | Successfully processed VNC framebuffer-update messages per second, including empty, cursor-only and resize updates. Multiple rectangles in one message count once. This is **not displayed FPS**; quiet desktops can show zero. |
+| Incoming VNC (TCP) | macOS's received TCP payload-byte counter for this connection, expressed in **KiB/s** (1 KiB = 1024 bytes). Includes framebuffer, clipboard and control messages, and may include TCP retransmissions. Excludes TCP/IP headers and Tailscale overhead. Bytes can arrive before a complete message is decoded. This is traffic rate, not link capacity. |
+| Clipboard mode | Negotiated UTF-8 or Latin-1 fallback, plus the viewer's sharing setting. Capability negotiation does not prove that the host imported or pasted text. |
+| Connected duration | Time since connection setup completed, using the session's monotonic clock. Excludes setup time and freezes when the session ends. |
+| Last disconnect | The reason for the latest ended connection attempt, including deliberate disconnects and failed setup. Retained during a new attempt, for this app launch only. |
+
+Rates start with **Sampling…** on opening or reconnecting, then use the actual time between samples. **Unavailable** means the operating-system byte counter could not be read; it is not a zero-traffic reading. Ended sessions show no live rates. The latest session's resolution, mode and duration remain available after disconnect; no session history is saved.
+
+These are content-free, in-memory counters. There are no statistics logs, exports, background probes or latency estimates. Opening Stats never reads the clipboard or Keychain and does not change profiles. The Ubuntu host's separate `--stats` option is not required.
 
 ### Connection profiles
 

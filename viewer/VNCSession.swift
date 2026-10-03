@@ -80,6 +80,22 @@ struct SessionUpdate: Sendable {
     let clipboardError: String?
 }
 
+// Content-free counters only. A statistics reader does not consume UI events,
+// pixel snapshots or clipboard data, and owns only this immutable value.
+struct SessionStatistics: Sendable {
+    let id: UUID
+    let sampledAt: TimeInterval
+    let state: SessionState
+    let width: Int
+    let height: Int
+    let framebufferUpdates: UInt64
+    let receivedBytes: UInt64? // macOS TCP payload counter; may include retransmissions.
+    let connectedAt: TimeInterval?
+    let endedAt: TimeInterval?
+    let clipboardUTF8: Bool
+    let clipboardEnabled: Bool
+}
+
 // The one unchecked Sendable boundary is audited here: every shared field is
 // protected by lock. The opaque C client exists only as a local in run(), on
 // one dedicated worker. No AppKit object or unsafe pointer crosses the lock.
@@ -90,6 +106,10 @@ final class VNCSession: @unchecked Sendable {
     private let lock = NSLock()
     private var state: SessionState = .connecting
     private var established = false // Lifecycle history, under lock; no credentials retained.
+    private let statisticsID = UUID()
+    private var connectedAt: TimeInterval?
+    private var endedAt: TimeInterval?
+    private var framebufferInfo = SDVNCFramebufferInfo()
     private var stopReason: SessionEnd?
     private var cancelSocket: Int32 = -1 // Owned duplicate; shutdown cancels C I/O.
     private var ioDeadline: TimeInterval = 0
@@ -218,6 +238,29 @@ final class VNCSession: @unchecked Sendable {
         }
     }
 
+    // Called when the panel opens, then once per second while it is visible.
+    // The final, socket-free snapshot is retained when a session ends.
+    // getsockopt reads local kernel state only: no network I/O or probes, and
+    // no LibVNCClient calls on the UI thread. The lock protects socket lifetime.
+    func statistics() -> SessionStatistics {
+        lock.withLock {
+            var receivedBytes: UInt64?
+            if state.ready, cancelSocket >= 0 {
+                var info = tcp_connection_info()
+                var length = socklen_t(MemoryLayout<tcp_connection_info>.size)
+                if getsockopt(cancelSocket, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &length) == 0,
+                   length == MemoryLayout<tcp_connection_info>.size {
+                    receivedBytes = info.tcpi_rxbytes
+                }
+            }
+            return SessionStatistics(id: statisticsID, sampledAt: ProcessInfo.processInfo.systemUptime, state: state,
+                                     width: Int(framebufferInfo.width), height: Int(framebufferInfo.height),
+                                     framebufferUpdates: framebufferInfo.updates, receivedBytes: receivedBytes,
+                                     connectedAt: connectedAt, endedAt: endedAt,
+                                     clipboardUTF8: clipboardUTF8, clipboardEnabled: clipboardEnabled)
+        }
+    }
+
     private func beginIO(timeout: TimeInterval) {
         lock.withLock { ioDeadline = ProcessInfo.processInfo.systemUptime + timeout }
     }
@@ -255,6 +298,8 @@ final class VNCSession: @unchecked Sendable {
                 guard healthy, stopReason == nil else { return false }
                 state = .connected
                 established = true
+                connectedAt = ProcessInfo.processInfo.systemUptime
+                framebufferInfo = sd_vnc_framebuffer_info(client)
                 return true
             }
             while healthy && connected {
@@ -302,7 +347,10 @@ final class VNCSession: @unchecked Sendable {
                 else if ready > 0 {
                     beginIO(timeout: 20)
                     healthy = autoreleasepool { sd_vnc_process_message(client) }
-                    lock.withLock { clipboardUTF8 = sd_vnc_clipboard_utf8(client) }
+                    lock.withLock {
+                        clipboardUTF8 = sd_vnc_clipboard_utf8(client)
+                        framebufferInfo = sd_vnc_framebuffer_info(client)
+                    }
                     endIO()
                 }
             }
@@ -314,7 +362,8 @@ final class VNCSession: @unchecked Sendable {
         password = nil
         lock.withLock {
             state = .finished(stopReason ?? (connected ? .connectionClosed : .setupFailed))
-            clipboardUTF8 = false
+            endedAt = ProcessInfo.processInfo.systemUptime
+            // Retain the negotiated mode for the last-session summary, not text.
             pendingClipboardError = nil
             packets = []
             queuedBytes = 0

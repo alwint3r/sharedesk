@@ -24,7 +24,7 @@ typedef struct {
 } SDVNCCallbacks;
 
 /* The worker owns the handle. No function starts a thread or schedules work.
- * All operations except destroy/socket may block. The caller controls elapsed
+ * Network operations may block. The caller controls elapsed
  * deadlines and cancellation by shutting down its own duplicate of socket().
  * The framebuffer is bridge-owned, native-endian 32-bit 0x00RRGGBB. */
 SDVNCClient *sd_vnc_create(SDVNCCallbacks callbacks, void *context);
@@ -38,6 +38,12 @@ bool sd_vnc_initialize_framebuffer(SDVNCClient *client);
  * wait bounds only the readiness check, not process_message(). */
 int sd_vnc_wait(SDVNCClient *client, unsigned int timeout_microseconds);
 bool sd_vnc_process_message(SDVNCClient *client);
+typedef struct {
+    int width, height;
+    uint64_t updates; /* Completed framebuffer-update messages, including metadata-only updates. */
+} SDVNCFramebufferInfo;
+/* Worker-only, nonblocking value snapshot. No allocation or retained buffers. */
+SDVNCFramebufferInfo sd_vnc_framebuffer_info(SDVNCClient *client);
 bool sd_vnc_write(SDVNCClient *client, const uint8_t *packet, size_t length);
 bool sd_vnc_clipboard_utf8(SDVNCClient *client); /* Negotiated text/provide support. */
 typedef enum {

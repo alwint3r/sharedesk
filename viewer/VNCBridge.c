@@ -14,6 +14,7 @@ struct SDVNCClient {
     SDVNCCallbacks callbacks;
     void *context;
     const char *password;
+    uint64_t framebuffer_updates;
     uint32_t clipboard_capabilities;
     uint32_t clipboard_unsolicited_limit;
     uint64_t clipboard_epoch;
@@ -266,7 +267,13 @@ bool sd_vnc_process_message(SDVNCClient *bridge) {
     uint8_t type;
     if (bridge->rfb->buffered) type = (uint8_t)bridge->rfb->bufoutptr[0];
     else if (recv(bridge->rfb->sock, &type, 1, MSG_PEEK) != 1) return false;
-    return type == rfbServerCutText ? process_clipboard(bridge) : HandleRFBServerMessage(bridge->rfb);
+    bool success = type == rfbServerCutText ? process_clipboard(bridge) : HandleRFBServerMessage(bridge->rfb);
+    if (success && type == rfbFramebufferUpdate) ++bridge->framebuffer_updates;
+    return success;
+}
+
+SDVNCFramebufferInfo sd_vnc_framebuffer_info(SDVNCClient *bridge) {
+    return (SDVNCFramebufferInfo){bridge->rfb->width, bridge->rfb->height, bridge->framebuffer_updates};
 }
 
 bool sd_vnc_clipboard_utf8(SDVNCClient *bridge) {

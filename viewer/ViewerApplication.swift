@@ -20,6 +20,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var controlPanel: NSGlassEffectView!
     private var connectionRow: NSStackView!
     private var connectionFooter: NSStackView!
+    private var statisticsButton: NSButton!
+    private var statisticsWindow: ConnectionStatistics?
+    private var lastSessionStatistics: SessionStatistics?
+    private var lastDisconnect: SessionEnd?
+    private var nextStatisticsRefresh: TimeInterval = 0
     private var statusField: NSTextField!
     private var connectionStateField: NSTextField!
     private var connectionStateImage: NSImageView!
@@ -256,7 +261,16 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         zoomControl.setContentHuggingPriority(.required, for: .horizontal)
         zoomControl.setContentCompressionResistancePriority(.required, for: .horizontal)
         updateZoomControls()
-        let footer = NSStackView(views: [state, statusField, zoomControl, controlsToggleButton])
+        statisticsButton = NSButton(title: "Stats", target: self, action: #selector(showStatistics(_:)))
+        statisticsButton.bezelStyle = .glass
+        statisticsButton.font = .systemFont(ofSize: 12)
+        statisticsButton.image = NSImage(systemSymbolName: "chart.bar", accessibilityDescription: nil)
+        statisticsButton.imagePosition = .imageLeading
+        statisticsButton.toolTip = "Show connection statistics. No content logging or saved history."
+        statisticsButton.setAccessibilityLabel("Show connection statistics")
+        statisticsButton.setContentHuggingPriority(.required, for: .horizontal)
+        statisticsButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let footer = NSStackView(views: [state, statusField, statisticsButton, zoomControl, controlsToggleButton])
         connectionFooter = footer
         footer.orientation = .horizontal
         footer.alignment = .centerY
@@ -316,6 +330,23 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.contentView?.layoutSubtreeIfNeeded()
     }
 
+    @objc private func showStatistics(_ sender: Any?) {
+        desktop.releaseInput()
+        if statisticsWindow == nil {
+            statisticsWindow = ConnectionStatistics()
+            statisticsWindow?.window?.center()
+        }
+        let wasVisible = statisticsWindow?.window?.isVisible == true
+        statisticsWindow?.showWindow(sender)
+        if !wasVisible { refreshStatistics() }
+    }
+
+    private func refreshStatistics() {
+        guard let statisticsWindow, statisticsWindow.window?.isVisible == true else { return }
+        statisticsWindow.update(session?.statistics() ?? lastSessionStatistics, lastDisconnect: lastDisconnect)
+        nextStatisticsRefresh = ProcessInfo.processInfo.systemUptime + 1
+    }
+
     @objc private func changeZoom(_ sender: NSSegmentedControl) {
         guard desktop.hasFramebuffer, ready else { return }
         let current = desktopViewport.zoomFactor
@@ -346,11 +377,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private func updateFocusOrder() {
         let order: [NSView]
         if controlPanel.isHidden {
-            order = [desktop, statusField, zoomControl, connectButton, controlsToggleButton]
+            order = [desktop, statusField, statisticsButton, zoomControl, connectButton, controlsToggleButton]
         } else {
             order = [profilePopup, addProfileButton, editProfileButton, deleteProfileButton,
                      hostField, portField, passwordField, connectButton, clipboardButton, sendButton,
-                     desktop, statusField, zoomControl, controlsToggleButton]
+                     desktop, statusField, statisticsButton, zoomControl, controlsToggleButton]
         }
         for index in order.indices { order[index].nextKeyView = order[(index + 1) % order.count] }
     }
@@ -621,6 +652,9 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc private func poll(_ timer: Timer) {
+        defer {
+            if ProcessInfo.processInfo.systemUptime >= nextStatisticsRefresh { refreshStatistics() }
+        }
         guard let session else { return }
         let update = session.poll()
         let wasReady = ready
@@ -660,6 +694,9 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             desktop.clearDesktop()
             updateZoomControls()
             desktop.session = nil
+            lastSessionStatistics = session.statistics() // Content-free summary after socket cleanup.
+            if case .finished(let reason) = update.state { lastDisconnect = reason }
+            nextStatisticsRefresh = 0
             self.session = nil
             ready = false
             sendButton.isEnabled = false
@@ -677,7 +714,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     func windowDidResignKey(_ notification: Notification) { desktop.releaseInput() }
-    func windowWillClose(_ notification: Notification) { desktop.releaseInput(); session?.stop() }
+    func windowWillClose(_ notification: Notification) {
+        statisticsWindow?.close()
+        desktop.releaseInput()
+        session?.stop()
+    }
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); timer = nil }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
