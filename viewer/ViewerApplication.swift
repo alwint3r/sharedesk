@@ -24,6 +24,9 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var connectionStateField: NSTextField!
     private var connectionStateImage: NSImageView!
     private var desktop: DesktopView!
+    private var desktopViewport: DesktopScrollView!
+    private var zoomControl: NSSegmentedControl!
+    private let zoomLevels: [CGFloat] = [1, 1.25, 1.5, 2, 3, 4]
     private var session: VNCSession?
     private var timer: Timer?
     private var pasteboard = NSPasteboard.general // Main thread only; never the worker.
@@ -182,11 +185,26 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         desktop = DesktopView()
         desktop.controller = self
         desktop.wantsLayer = true
-        desktop.layer?.cornerRadius = 16
-        desktop.layer?.masksToBounds = true
         desktop.setAccessibilityLabel("Remote desktop")
-        desktop.setAccessibilityHelp("Choose a profile or enter a host above, then connect. Click the desktop to send keyboard and pointer input.")
-        desktop.setContentHuggingPriority(.defaultLow, for: .vertical)
+        desktop.setAccessibilityHelp("Choose a profile or enter a host above, then connect. Click the desktop to send keyboard and pointer input. When zoomed, use local scrollbars to move the view; the mouse wheel controls Ubuntu.")
+        desktopViewport = DesktopScrollView()
+        desktopViewport.borderType = .noBorder
+        desktopViewport.backgroundColor = .black
+        desktopViewport.automaticallyAdjustsContentInsets = false
+        desktopViewport.contentView.automaticallyAdjustsContentInsets = false
+        desktopViewport.hasHorizontalScroller = true
+        desktopViewport.hasVerticalScroller = true
+        desktopViewport.scrollerStyle = .legacy // Discoverable without consuming wheel input.
+        desktopViewport.autohidesScrollers = false // Geometry shows only the axes that need them.
+        desktopViewport.horizontalScrollElasticity = .none
+        desktopViewport.verticalScrollElasticity = .none
+        desktopViewport.allowsMagnification = false // Buttons only; do not change gesture policy.
+        desktopViewport.isTouchScrollingEnabled = false // Local navigation is through scrollbars, not gestures.
+        desktopViewport.documentView = desktop
+        desktopViewport.wantsLayer = true
+        desktopViewport.layer?.cornerRadius = 16
+        desktopViewport.layer?.masksToBounds = true
+        desktopViewport.setContentHuggingPriority(.defaultLow, for: .vertical)
         connectionStateField = NSTextField(labelWithString: "Not connected")
         connectionStateField.font = .systemFont(ofSize: 11, weight: .semibold)
         connectionStateField.textColor = .secondaryLabelColor
@@ -215,12 +233,28 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         controlsToggleButton.toolTip = "Hide connection controls to give the remote desktop more space."
         controlsToggleButton.setContentHuggingPriority(.required, for: .horizontal)
         controlsToggleButton.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let footer = NSStackView(views: [state, statusField, controlsToggleButton])
+        zoomControl = NSSegmentedControl(labels: ["", "Fit", ""], trackingMode: .momentary, target: self, action: #selector(changeZoom(_:)))
+        zoomControl.controlSize = .small
+        zoomControl.font = .systemFont(ofSize: 12)
+        zoomControl.setImage(NSImage(systemSymbolName: "minus.magnifyingglass", accessibilityDescription: "Zoom out"), forSegment: 0)
+        zoomControl.setImage(NSImage(systemSymbolName: "plus.magnifyingglass", accessibilityDescription: "Zoom in"), forSegment: 2)
+        zoomControl.setWidth(28, forSegment: 0)
+        zoomControl.setWidth(50, forSegment: 1)
+        zoomControl.setWidth(28, forSegment: 2)
+        zoomControl.setToolTip("Zoom out towards Fit Desktop.", forSegment: 0)
+        zoomControl.setToolTip("Fit Desktop: reset zoom and show the whole remote image.", forSegment: 1)
+        zoomControl.setToolTip("Zoom in relative to Fit Desktop. Use local scrollbars to move the view.", forSegment: 2)
+        zoomControl.setAccessibilityLabel("Desktop zoom")
+        zoomControl.setAccessibilityHelp("Zoom is relative to Fit Desktop. The middle button resets to Fit. Mouse-wheel input still goes to Ubuntu.")
+        zoomControl.setContentHuggingPriority(.required, for: .horizontal)
+        zoomControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+        updateZoomControls()
+        let footer = NSStackView(views: [state, statusField, zoomControl, controlsToggleButton])
         connectionFooter = footer
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 16
-        let stack = NSStackView(views: [panel, desktop, footer])
+        let stack = NSStackView(views: [panel, desktopViewport, footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -234,11 +268,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             stack.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor, constant: 12),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             panel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            desktop.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            desktopViewport.widthAnchor.constraint(equalTo: stack.widthAnchor),
             footer.widthAnchor.constraint(equalTo: stack.widthAnchor),
             connectionStateImage.widthAnchor.constraint(equalToConstant: 10),
             connectionStateImage.heightAnchor.constraint(equalToConstant: 10),
-            desktop.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
+            desktopViewport.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
         ])
         updateFocusOrder()
         window.autorecalculatesKeyViewLoop = false
@@ -275,12 +309,42 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.contentView?.layoutSubtreeIfNeeded()
     }
 
+    @objc private func changeZoom(_ sender: NSSegmentedControl) {
+        guard desktop.hasFramebuffer, ready else { return }
+        let current = desktopViewport.zoomFactor
+        let next: CGFloat
+        switch sender.selectedSegment {
+        case 0: next = zoomLevels.last(where: { $0 < current - 0.001 }) ?? zoomLevels[0]
+        case 1: next = zoomLevels[0]
+        case 2: next = zoomLevels.first(where: { $0 > current + 0.001 }) ?? zoomLevels[zoomLevels.count - 1]
+        default: return
+        }
+        desktopViewport.setZoom(next)
+        window.contentView?.layoutSubtreeIfNeeded()
+        desktopViewport.flashScrollers()
+        window.invalidateCursorRects(for: desktop)
+        updateZoomControls()
+        window.makeFirstResponder(desktop)
+    }
+
+    private func updateZoomControls() {
+        let scale = desktopViewport.zoomFactor
+        let label = scale <= 1.001 ? "Fit" : String(format: "%g×", Double(scale))
+        if zoomControl.label(forSegment: 1) != label { zoomControl.setLabel(label, forSegment: 1) }
+        zoomControl.isEnabled = ready && desktop.hasFramebuffer
+        zoomControl.setEnabled(scale > zoomLevels[0] + 0.001, forSegment: 0)
+        zoomControl.setEnabled(scale < zoomLevels[zoomLevels.count - 1] - 0.001, forSegment: 2)
+    }
+
     private func updateFocusOrder() {
-        let order: [NSView] = controlPanel.isHidden
-            ? [desktop, statusField, connectButton, controlsToggleButton]
-            : [profilePopup, addProfileButton, editProfileButton, deleteProfileButton,
-               hostField, portField, passwordField, connectButton, clipboardButton, sendButton,
-               desktop, statusField, controlsToggleButton]
+        let order: [NSView]
+        if controlPanel.isHidden {
+            order = [desktop, statusField, zoomControl, connectButton, controlsToggleButton]
+        } else {
+            order = [profilePopup, addProfileButton, editProfileButton, deleteProfileButton,
+                     hostField, portField, passwordField, connectButton, clipboardButton, sendButton,
+                     desktop, statusField, zoomControl, controlsToggleButton]
+        }
         for index in order.indices { order[index].nextKeyView = order[(index + 1) % order.count] }
     }
 
@@ -316,6 +380,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             return
         }
         desktop.clearDesktop()
+        updateZoomControls()
         let session = VNCSession(host: target.host, port: target.port, password: password)
         self.session = session
         desktop.session = session
@@ -529,6 +594,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
         if let frame = update.frame { desktop.showFrame(frame) }
         if let cursor = update.cursor { desktop.showCursor(cursor) }
+        if ready != wasReady || update.frame != nil { updateZoomControls() }
         if let data = update.clipboard, clipboardButton.state == .on, ready,
            let text = String(data: data, encoding: .isoLatin1) {
             pasteboard.clearContents()
@@ -544,6 +610,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
         if update.state.finished {
             desktop.clearDesktop()
+            updateZoomControls()
             desktop.session = nil
             self.session = nil
             ready = false

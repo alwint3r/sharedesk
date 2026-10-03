@@ -2,12 +2,91 @@ import AppKit
 import Carbon
 import SharedeskVNC
 
+// Native scrollbars move the document. Its image scale is shared by drawing
+// and input mapping; wheel input over the canvas remains remote input.
+@MainActor
+final class DesktopScrollView: NSScrollView {
+    private(set) var zoomFactor: CGFloat = 1
+    private var resizeCenter: NSPoint?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        if newSize != frame.size, resizeCenter == nil { resizeCenter = remoteCenter }
+        super.setFrameSize(newSize)
+    }
+
+    func setZoom(_ factor: CGFloat) {
+        precondition(factor.isFinite && factor >= 1)
+        let center = remoteCenter
+        zoomFactor = factor
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        if let center { scrollToRemoteCenter(center) }
+    }
+
+    fileprivate var remoteCenter: NSPoint? {
+        guard let desktop = documentView as? DesktopView else { return nil }
+        let image = desktop.desktopRect
+        guard image.width > 0, image.height > 0 else { return nil }
+        return NSPoint(x: (contentView.bounds.midX - image.minX) / image.width,
+                       y: (contentView.bounds.midY - image.minY) / image.height)
+    }
+
+    fileprivate func scrollToRemoteCenter(_ center: NSPoint) {
+        guard let desktop = documentView as? DesktopView else { return }
+        let image = desktop.desktopRect
+        let origin = NSPoint(x: image.minX + center.x * image.width - contentView.bounds.width / 2,
+                             y: image.minY + center.y * image.height - contentView.bounds.height / 2)
+        let proposed = NSRect(origin: origin, size: contentView.bounds.size)
+        contentView.scroll(to: contentView.constrainBoundsRect(proposed).origin)
+        reflectScrolledClipView(contentView)
+        window?.invalidateCursorRects(for: desktop)
+    }
+
+    override func layout() {
+        let center = resizeCenter ?? remoteCenter
+        resizeCenter = nil
+        super.layout()
+        guard let desktop = documentView as? DesktopView, bounds.width > 16, bounds.height > 16 else { return }
+        var imageSize = NSSize.zero
+        if let image = desktop.framebuffer {
+            let fit = min((bounds.width - 16) / CGFloat(image.width), (bounds.height - 16) / CGFloat(image.height))
+            desktop.imageScale = fit * zoomFactor
+            imageSize = NSSize(width: CGFloat(image.width) * desktop.imageScale,
+                               height: CGFloat(image.height) * desktop.imageScale)
+        }
+        // Decide both scrollbar axes together, including space for legacy bars.
+        // This avoids Fit/scrollbar feedback loops and large empty pan regions.
+        let bar = scrollerStyle == .legacy ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
+        var horizontal = imageSize.width + 16 > bounds.width + 0.01
+        var vertical = imageSize.height + 16 > bounds.height + 0.01
+        for _ in 0..<2 {
+            horizontal = horizontal || imageSize.width + 16 > bounds.width - (vertical ? bar : 0) + 0.01
+            vertical = vertical || imageSize.height + 16 > bounds.height - (horizontal ? bar : 0) + 0.01
+        }
+        hasHorizontalScroller = horizontal
+        hasVerticalScroller = vertical
+        tile()
+        let size = NSSize(width: max(contentView.frame.width, imageSize.width + 16),
+                          height: max(contentView.frame.height, imageSize.height + 16))
+        if desktop.frame.size != size { desktop.setFrameSize(size) }
+        if let center { scrollToRemoteCenter(center) }
+        desktop.needsDisplay = true
+        window?.invalidateCursorRects(for: desktop)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        // Do not let NSScrollView turn Ubuntu wheel input into local panning.
+        documentView?.scrollWheel(with: event)
+    }
+}
+
 @MainActor
 final class DesktopView: NSView {
     var session: VNCSession?
     weak var controller: ViewerApplication?
     var inputEnabled = false
-    private var framebuffer: CGImage?
+    fileprivate var framebuffer: CGImage?
+    fileprivate var imageScale: CGFloat = 1
     private var remoteCursor: NSCursor?
     private var pointerTracking: NSTrackingArea?
     private var heldKeys: [UInt32] = Array(repeating: 0, count: 256)
@@ -19,29 +98,39 @@ final class DesktopView: NSView {
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
+    var hasFramebuffer: Bool { framebuffer != nil }
 
     func clearDesktop() {
         releaseInput()
         inputEnabled = false
         framebuffer = nil
         remoteCursor = nil
+        (enclosingScrollView as? DesktopScrollView)?.setZoom(1)
+        enclosingScrollView?.contentView.scroll(to: .zero)
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
 
-    private var desktopRect: NSRect {
+    fileprivate var desktopRect: NSRect {
         guard let framebuffer else { return .zero }
-        let width = CGFloat(framebuffer.width), height = CGFloat(framebuffer.height)
-        // Keep every remote pixel inside the rounded canvas, including corners.
-        let viewport = bounds.insetBy(dx: 8, dy: 8)
-        let scale = min(viewport.width / width, viewport.height / height)
-        return NSRect(x: viewport.midX - width * scale / 2, y: viewport.midY - height * scale / 2,
-                      width: width * scale, height: height * scale)
+        let width = CGFloat(framebuffer.width) * imageScale
+        let height = CGFloat(framebuffer.height) * imageScale
+        // Fit leaves eight points around the image; zoomed documents keep the
+        // same edge margin and centre any axis that needs no local scrolling.
+        return NSRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
     }
 
     func showFrame(_ frame: PixelFrame) {
         guard let image = frame.image(alpha: .noneSkipFirst) else { return }
+        let resized = framebuffer?.width != image.width || framebuffer?.height != image.height
+        let viewport = enclosingScrollView as? DesktopScrollView
+        let center = resized ? viewport?.remoteCenter : nil
         framebuffer = image
+        if resized {
+            viewport?.needsLayout = true
+            viewport?.layoutSubtreeIfNeeded()
+            if let center { viewport?.scrollToRemoteCenter(center) }
+        }
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
@@ -105,7 +194,7 @@ final class DesktopView: NSView {
         let rect = desktopRect
         guard rect.width > 0, rect.height > 0 else { return false }
         let point = convert(event.locationInWindow, from: nil)
-        guard clamp || NSPointInRect(point, rect) else { return false }
+        guard clamp || (NSPointInRect(point, rect) && NSPointInRect(point, visibleRect)) else { return false }
         lastX = Int(max(0, min(CGFloat(framebuffer.width - 1), floor((point.x - rect.minX) * CGFloat(framebuffer.width) / rect.width))))
         lastY = Int(max(0, min(CGFloat(framebuffer.height - 1), floor((point.y - rect.minY) * CGFloat(framebuffer.height) / rect.height))))
         return true
