@@ -99,6 +99,8 @@ final class DesktopView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     var hasFramebuffer: Bool { framebuffer != nil }
+    // Immutable owning image, independent of local zoom, viewport and cursor.
+    var framebufferSnapshot: CGImage? { framebuffer }
 
     func clearDesktop() {
         releaseInput()

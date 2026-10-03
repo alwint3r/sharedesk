@@ -8,14 +8,18 @@ pkg_check_modules(VNC_CLIENT REQUIRED IMPORTED_TARGET libvncclient>=0.9.15)
 find_library(COCOA_FRAMEWORK Cocoa)
 find_library(CARBON_FRAMEWORK Carbon)
 find_library(SECURITY_FRAMEWORK Security)
+find_library(NETWORK_FRAMEWORK Network)
+find_library(IMAGEIO_FRAMEWORK ImageIO)
+find_library(UTTYPE_FRAMEWORK UniformTypeIdentifiers)
 
 set_source_files_properties(sharedesk-viewer.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 add_executable(sharedesk-viewer MACOSX_BUNDLE
     main.swift ViewerApplication.swift DesktopView.swift VNCSession.swift
-    ConnectionProfiles.swift ProfilePasswords.swift ProfileEditor.swift ConnectionStatistics.swift VNCBridge.c sharedesk-viewer.icns)
+    ConnectionProfiles.swift ProfilePasswords.swift ProfileEditor.swift ConnectionStatistics.swift
+    MCPServer.swift MCPHTTPConnection.swift MCPServerWindow.swift VNCBridge.c sharedesk-viewer.icns)
 target_include_directories(sharedesk-viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(sharedesk-viewer PRIVATE "$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Wpedantic>")
-target_link_libraries(sharedesk-viewer PRIVATE PkgConfig::VNC_CLIENT ZLIB::ZLIB ${COCOA_FRAMEWORK} ${CARBON_FRAMEWORK} ${SECURITY_FRAMEWORK})
+target_link_libraries(sharedesk-viewer PRIVATE PkgConfig::VNC_CLIENT ZLIB::ZLIB ${COCOA_FRAMEWORK} ${CARBON_FRAMEWORK} ${SECURITY_FRAMEWORK} ${NETWORK_FRAMEWORK} ${IMAGEIO_FRAMEWORK} ${UTTYPE_FRAMEWORK})
 set_target_properties(sharedesk-viewer PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES

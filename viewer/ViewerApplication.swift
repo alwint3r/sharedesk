@@ -22,6 +22,8 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var connectionFooter: NSStackView!
     private var statisticsButton: NSButton!
     private var statisticsWindow: ConnectionStatistics?
+    private var mcpWindow: MCPServerWindow?
+    private var privatePasteboardChange: Int? // Local MCP credential copy; never export, even with Send Clipboard.
     private var lastSessionStatistics: SessionStatistics?
     private var lastDisconnect: SessionEnd?
     private var nextStatisticsRefresh: TimeInterval = 0
@@ -50,6 +52,8 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         menu.addItem(appItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let mcpItem = appMenu.addItem(withTitle: "MCP Server…", action: #selector(showMCPServer(_:)), keyEquivalent: "")
+        mcpItem.target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Sharedesk", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -339,6 +343,37 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         let wasVisible = statisticsWindow?.window?.isVisible == true
         statisticsWindow?.showWindow(sender)
         if !wasVisible { refreshStatistics() }
+    }
+
+    @objc private func showMCPServer(_ sender: Any?) {
+        desktop.releaseInput()
+        if mcpWindow == nil {
+            mcpWindow = MCPServerWindow(snapshot: { [weak self] in
+                guard let self else { return MCPDesktopSnapshot(connectionID: nil, state: .finished(.disconnected), image: nil) }
+                // Read live state without consuming poll events or sampling the
+                // socket. This closes the gap before the next UI poll on loss.
+                let status = self.session?.connectionStatus()
+                let state = status?.state ?? self.connectionState
+                return MCPDesktopSnapshot(connectionID: status?.id, state: state,
+                                          image: state.ready && self.ready ? self.desktop.framebufferSnapshot : nil)
+            }, copyLocal: { [weak self] text in self?.copyMCPConfiguration(text) ?? false })
+            mcpWindow?.window?.center()
+        }
+        mcpWindow?.showWindow(sender)
+    }
+
+    private func copyMCPConfiguration(_ text: String) -> Bool {
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        let item = NSPasteboardItem()
+        item.setString(text, forType: .string)
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        let written = pasteboard.writeObjects([item])
+        // Atomic with the write on MainActor: input and timer-driven sync
+        // cannot observe a secret copy before its suppression baseline.
+        pasteboardChange = pasteboard.changeCount
+        privatePasteboardChange = pasteboardChange
+        return written
     }
 
     private func refreshStatistics() {
@@ -641,6 +676,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func syncClipboard(force: Bool) {
         guard ready, clipboardButton.state == .on else { return }
         let change = pasteboard.changeCount
+        if change == privatePasteboardChange {
+            if force { showStatus("MCP credentials are local-only and cannot be sent to Ubuntu. Copy other text first.") }
+            return
+        }
+        privatePasteboardChange = nil
         guard force || change != pasteboardChange else { return }
         pasteboardChange = change
         guard let text = pasteboard.string(forType: .string) else {
@@ -716,12 +756,18 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func windowDidResignKey(_ notification: Notification) { desktop.releaseInput() }
     func windowWillClose(_ notification: Notification) {
         statisticsWindow?.close()
+        mcpWindow?.server.stop()
+        mcpWindow?.close()
         desktop.releaseInput()
         session?.stop()
     }
-    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); timer = nil }
+    func applicationWillTerminate(_ notification: Notification) {
+        mcpWindow?.server.stop()
+        timer?.invalidate(); timer = nil
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        mcpWindow?.server.stop()
         if let session {
             terminating = true
             desktop.releaseInput()

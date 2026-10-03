@@ -238,6 +238,12 @@ final class VNCSession: @unchecked Sendable {
         }
     }
 
+    // Non-consuming identity/lifecycle read for MCP. No socket sampling,
+    // framebuffer retention or extra VNC worker/connection.
+    func connectionStatus() -> (id: UUID, state: SessionState) {
+        lock.withLock { (statisticsID, state) }
+    }
+
     // Called when the panel opens, then once per second while it is visible.
     // The final, socket-free snapshot is retained when a session ends.
     // getsockopt reads local kernel state only: no network I/O or probes, and
