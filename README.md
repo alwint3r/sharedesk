@@ -85,7 +85,13 @@ open build-mac/sharedesk-viewer.app
 
 **Upgrading an existing build:** CMake cannot change an existing build directory from Unix Makefiles to Ninja. Before configuring, move the old `build-mac` directory to an unused backup path, such as `build-mac-objectivec`, then run the commands above. Keep the working app and its source revision until normal use with the Swift viewer confirms the migration. Quit the Swift viewer before opening the fallback app at `build-mac-objectivec/sharedesk-viewer.app`.
 
-CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer. The ordinary development app requires the Homebrew libraries on the Mac where it runs. Use the [private installer](#install-the-mac-viewer) for a self-contained copy.
+CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer.
+
+Connection controls use native AppKit Liquid Glass in light and dark appearance, with a separate rounded remote-desktop canvas and a connection-state footer. Glass stays off the remote image.
+
+Use **Hide Controls** in the footer to collapse the top panel and give the desktop more space; **Show Controls** restores it. Connect/Disconnect stays available in the footer while collapsed. Fields and clipboard settings are retained, and controls start visible on each launch. Connection validation errors reveal the fields when input is needed.
+
+The ordinary development app requires the Homebrew libraries on the Mac where it runs. Use the [private installer](#install-the-mac-viewer) for a self-contained copy.
 
 One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
 

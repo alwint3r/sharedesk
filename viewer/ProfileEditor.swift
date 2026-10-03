@@ -41,8 +41,15 @@ final class ProfileEditor: NSObject {
         form.orientation = .vertical
         form.alignment = .leading
         form.spacing = 8
-        for field in [nameField, hostField, portField, passwordField] {
-            field.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        for label in form.arrangedSubviews.compactMap({ $0 as? NSTextField }) where !label.isEditable {
+            label.font = .systemFont(ofSize: 11, weight: .medium)
+            label.textColor = .labelColor
+        }
+        for (field, title) in [(nameField, "Profile name"), (hostField, "Host address"), (portField, "Port"), (passwordField, "Saved password")] {
+            field.controlSize = .large
+            field.font = .systemFont(ofSize: 13)
+            field.setAccessibilityLabel(title)
+            field.widthAnchor.constraint(equalToConstant: 440).isActive = true
         }
         form.setFrameSize(form.fittingSize)
         alert.accessoryView = form

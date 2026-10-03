@@ -32,8 +32,10 @@ final class DesktopView: NSView {
     private var desktopRect: NSRect {
         guard let framebuffer else { return .zero }
         let width = CGFloat(framebuffer.width), height = CGFloat(framebuffer.height)
-        let scale = min(bounds.width / width, bounds.height / height)
-        return NSRect(x: (bounds.width - width * scale) / 2, y: (bounds.height - height * scale) / 2,
+        // Keep every remote pixel inside the rounded canvas, including corners.
+        let viewport = bounds.insetBy(dx: 8, dy: 8)
+        let scale = min(viewport.width / width, viewport.height / height)
+        return NSRect(x: viewport.midX - width * scale / 2, y: viewport.midY - height * scale / 2,
                       width: width * scale, height: height * scale)
     }
 
@@ -67,10 +69,25 @@ final class DesktopView: NSView {
         NSColor.black.setFill()
         bounds.fill()
         guard let framebuffer else {
-            let label = "Connect to your Ubuntu desktop" as NSString
-            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 18), .foregroundColor: NSColor.lightGray]
-            let size = label.size(withAttributes: attributes)
-            label.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2), withAttributes: attributes)
+            NSColor(calibratedWhite: 0.075, alpha: 1).setFill()
+            bounds.fill()
+            let center = NSPoint(x: bounds.midX, y: bounds.midY)
+            if let icon = NSImage(systemSymbolName: "desktopcomputer", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 42, weight: .light)
+                    .applying(.init(hierarchicalColor: NSColor(calibratedWhite: 0.88, alpha: 1)))) {
+                icon.draw(in: NSRect(x: center.x - 30, y: center.y - 65, width: 60, height: 48),
+                          from: .zero, operation: .sourceOver, fraction: 0.55, respectFlipped: true, hints: nil)
+            }
+            let title = "Your Ubuntu desktop" as NSString
+            let titleStyle: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 19, weight: .medium),
+                                                            .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1)]
+            let titleSize = title.size(withAttributes: titleStyle)
+            title.draw(at: NSPoint(x: center.x - titleSize.width / 2, y: center.y), withAttributes: titleStyle)
+            let hint = "Choose a profile or enter a host above, then connect." as NSString
+            let hintStyle: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12),
+                                                           .foregroundColor: NSColor(calibratedWhite: 0.6, alpha: 1)]
+            let hintSize = hint.size(withAttributes: hintStyle)
+            hint.draw(at: NSPoint(x: center.x - hintSize.width / 2, y: center.y + 30), withAttributes: hintStyle)
             return
         }
         guard let context = NSGraphicsContext.current?.cgContext else { return }
