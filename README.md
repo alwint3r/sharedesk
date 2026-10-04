@@ -21,6 +21,11 @@ viewer/
   ViewerApplication.swift     # Window, controls and main-thread clipboard
   DesktopView.swift           # Rendering, cursor and input
   VNCSession.swift            # Worker, session state, queues and deadlines
+  VNCInputAction.swift        # Bounded input plans, release state and completion handles
+  MCPServer.swift             # Experimental loopback MCP lifecycle and tool dispatch
+  MCPHTTPConnection.swift     # Bounded HTTP/1.1 requests and responses
+  MCPServerWindow.swift       # Start/Stop, local credential copies and control permission
+  MCPControl.swift            # Input tool schemas, validation and concrete action plans
   ConnectionStatistics.swift  # On-demand, content-free session statistics panel
   ConnectionProfiles.swift    # Validated profile settings and private file storage
   ProfileEditor.swift         # Native Add/Edit dialog
@@ -140,6 +145,64 @@ The panel refreshes about once per second using the existing UI timer. It shows:
 Rates start with **Sampling…** on opening or reconnecting, then use the actual time between samples. **Unavailable** means the operating-system byte counter could not be read; it is not a zero-traffic reading. Ended sessions show no live rates. The latest session's resolution, mode and duration remain available after disconnect; no session history is saved.
 
 These are content-free, in-memory counters. There are no statistics logs, exports, background probes or latency estimates. Opening Stats never reads the clipboard or Keychain and does not change profiles. The Ubuntu host's separate `--stats` option is not required.
+
+### Experimental MCP access and control
+
+On `experiment/mcp-http-sse`, the viewer can serve its **current VNC connection** to a trusted MCP client on the same Mac. It does not open another VNC connection or change the Ubuntu host. Use **Sharedesk → MCP Server… → Start Server**. The server starts read-only and listens only on a system-selected **127.0.0.1** port.
+
+Use **Copy Client Config** to obtain the current `/mcp` URL and `Authorization: Bearer …` header. The copied example uses an `mcpServers` object with a `sharedesk` entry containing `type: "http"`, `url` and `headers`; adapt the outer configuration format to your client. The client must support **Streamable HTTP** and custom authorization headers, not the legacy HTTP+SSE transport. The official Python MCP SDK has been checked against this implementation.
+
+The server is off each launch. Every Start creates a fresh temporary token; the port may also change. Update the client configuration after restarting. **Stop**, closing the MCP window, closing the main viewer window, or quitting invalidates access. There is no token file, Keychain item, automatic connection, public listener or Tailscale listener for MCP.
+
+**Privacy:** screenshots can contain sensitive information. A client may store them or send them to an AI provider. Keep the token out of logs, source control and the remote desktop. The copy buttons mark their contents local-only and suppress Sharedesk's automatic and explicit Ubuntu clipboard export for that copy. Other Mac applications may still read or retain the local clipboard.
+
+#### Read-only tools
+
+- **`get_connection_status`** takes no arguments. It returns text containing JSON with `state`, `width`, `height`, `screenshotAvailable`, `controlEnabled` and `target`. The target is `null` without a connected framebuffer.
+- **`capture_screenshot`** takes no arguments. It returns a PNG of the latest received framebuffer, not a new capture request to Ubuntu. The whole image is included, independent of local zoom. Local controls and the separately rendered cursor are excluded. The longest PNG side is at most **1600 pixels**, without upscaling; encoded PNG data is limited to **8 MiB**. One capture can encode at a time, at most once per second. Disconnected or replaced connections cannot return a stale screenshot.
+
+Screenshot text includes a JSON metadata line with `target`, `image_width` and `image_height`. Both read-only tools remain available while input control is off.
+
+#### Allow mouse and keyboard control
+
+Connect to Ubuntu, then explicitly check **Allow MCP Control** in the MCP window. This permits **all clients holding the current token** to send input to this connection. Input can perform destructive actions with the logged-in Ubuntu user's permissions; there is no per-action confirmation dialog.
+
+Control resets to off when the MCP server or VNC connection ends. A local click, drag, scroll, key or modifier action in the remote-desktop area takes over: it revokes MCP control, cancels remaining automated input and releases automated keys/buttons before forwarding local input. Ordinary pointer movement alone does not revoke control; while control is enabled, that movement is not forwarded to Ubuntu. Enable the checkbox again when you want automation to resume. Changing local zoom or collapsing controls does not change permission.
+
+Each input call requires a **`target`** object copied from current status or screenshot metadata:
+
+```json
+{
+  "connection_id": "<copy the current connection UUID>",
+  "width": 1920,
+  "height": 1080
+}
+```
+
+Use the actual returned dimensions, not these example values. The connection ID and dimensions must still match when input starts. A resize during an action cancels its remaining input. After a resize or reconnect, obtain a new target rather than retrying with old metadata.
+
+**Coordinates are full remote-framebuffer pixels**, with `(0, 0)` at the top left. They are not Mac window coordinates or resized PNG coordinates. If a 1920×1080 desktop produces a 1600×900 PNG, image position `(800, 450)` corresponds to remote position `(960, 540)`. Scale using the returned dimensions; valid remote coordinates satisfy `0 ≤ x < width` and `0 ≤ y < height`.
+
+| Tool | Arguments in addition to `target` | Behavior |
+| --- | --- | --- |
+| `move_pointer` | Integer `x`, `y` | Move without holding a button. |
+| `click` | Integer `x`, `y`; optional `button`: `left`, `middle`, `right`; optional `count`: 1 or 2 | Complete click or double-click. Defaults: left, once. |
+| `drag` | Integer `from_x`, `from_y`, `to_x`, `to_y`; optional `button` | Bounded drag over about 0.4 seconds, then release. Default: left. |
+| `scroll` | Integer `x`, `y`; `direction`: `up`, `down`, `left`, `right`; optional `steps`: 1–10 | Wheel steps at the specified position. Default: one. Does not scroll the local viewport. |
+| `press_key` | `key`; optional `modifiers` array | One complete key combination. Modifiers: `Control`, `Alt`, `Shift`, `Super`, without duplicates. |
+| `type_text` | `text` | Type 1–128 printable ASCII characters, tabs or LF newlines using English (US) key events. No clipboard use. Unicode, CR and other control characters are rejected before sending. |
+
+`press_key` accepts one printable ASCII character or `Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`. Use lowercase letters for shortcuts and explicit `Shift` when needed. `Super` means Ubuntu's Super/Windows key, not a local Mac shortcut. A newline in `type_text` presses Enter and can submit a form or execute a command.
+
+There is at most one input action at a time, with no queued sequence of future tool calls and no indefinitely held-key/button tools. All socket writes and pacing stay on the existing VNC worker. A successful result means the input messages and releases were **sent**, not that an application accepted them. Errors and cancellation may follow partially sent input; inspect the desktop before retrying. Already sent events cannot be undone.
+
+Actions have a five-second deadline. Cancellation allows up to one second for releases. If a stalled network operation prevents safe cleanup, the viewer disconnects using its existing deadline mechanism instead of leaving input held. MCP itself never reconnects. Input calls do not trigger clipboard synchronization, read the clipboard, save typed text or log input contents; the viewer's separately enabled normal clipboard sharing retains its existing behavior.
+
+#### Transport boundaries
+
+The endpoint validates the bearer token and exact numeric loopback `Host`. An absent `Origin` is accepted; a supplied Origin must match the server's own `http://127.0.0.1:<port>` origin. There is no cross-origin browser access or OAuth flow. A client using a browser proxy must keep that proxy local and supply the header through its trusted backend.
+
+This is stateless Streamable HTTP supporting protocol versions `2025-11-25`, `2025-06-18` and `2025-03-26`. POST requests accept JSON and SSE responses. Screenshots use a short SSE response; other results use JSON. GET and DELETE return 405: no background event stream, replay or server-side MCP session is provided. Connections close after one exchange. Request headers are limited to 16 KiB, decoded bodies to 64 KiB, and concurrent HTTP connections to eight; request receipt/completion and response writes are bounded by ten- and fifteen-second deadlines respectively.
 
 ### Connection profiles
 

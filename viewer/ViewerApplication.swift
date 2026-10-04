@@ -356,10 +356,25 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 let state = status?.state ?? self.connectionState
                 return MCPDesktopSnapshot(connectionID: status?.id, state: state,
                                           image: state.ready && self.ready ? self.desktop.framebufferSnapshot : nil)
+            }, submitInput: { [weak self] plan in
+                guard let self, let session = self.session else {
+                    throw VNCInputError(message: "No VNC connection is available. Nothing was sent.")
+                }
+                // Opening the MCP panel or leaving desktop focus releases
+                // local input. Do not synthesize AppKit events here: those
+                // handlers also synchronize the clipboard.
+                return try session.beginInputAction(plan)
             }, copyLocal: { [weak self] text in self?.copyMCPConfiguration(text) ?? false })
             mcpWindow?.window?.center()
         }
         mcpWindow?.showWindow(sender)
+    }
+
+    var mcpControlEnabled: Bool { mcpWindow?.server.controlEnabled == true }
+
+    func takeOverMCPControl() {
+        guard mcpControlEnabled else { return }
+        mcpWindow?.server.revokeControl(reason: "Local input took over. Enable control again when ready.")
     }
 
     private func copyMCPConfiguration(_ text: String) -> Bool {
@@ -533,6 +548,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         } else {
             connectButton.toolTip = state.finished ? "Connect to the address and port shown above." : "Disconnect or cancel this connection."
         }
+        mcpWindow?.server.connectionDidChange()
     }
 
     private var selectedProfile: ConnectionProfile? {
@@ -697,6 +713,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
         guard let session else { return }
         let update = session.poll()
+        let hadFramebuffer = desktop.hasFramebuffer
         let wasReady = ready
         ready = update.state.ready
         sessionEstablished = update.established
@@ -713,6 +730,9 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if ready, let frame = update.frame { desktop.showFrame(frame) }
         if ready, let cursor = update.cursor { desktop.showCursor(cursor) }
         if ready != wasReady || update.frame != nil { updateZoomControls() }
+        if ready != wasReady || hadFramebuffer != desktop.hasFramebuffer {
+            mcpWindow?.server.connectionDidChange()
+        }
         if let data = update.clipboard, clipboardButton.state == .on, ready,
            let text = String(data: data, encoding: .utf8) {
             pasteboard.clearContents()

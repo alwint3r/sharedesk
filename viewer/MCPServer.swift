@@ -12,11 +12,31 @@ struct MCPDesktopSnapshot {
 }
 
 // Experimental, stateless Streamable HTTP. The viewer owns Start/Stop and the
-// snapshot provider. No VNC operations, pasteboard access, files or logging here.
+// snapshot and input providers. No blocking VNC calls, pasteboard access,
+// files or logging here. Input is denied unless explicitly enabled locally.
 @MainActor
 final class MCPServer {
     private let supportedVersions = ["2025-11-25", "2025-06-18", "2025-03-26"]
     private let snapshot: () -> MCPDesktopSnapshot
+    private let submitInput: (VNCInputPlan) throws -> VNCInputHandle
+    private var controlConnectionID: UUID?
+    private(set) var controlStatus = "Control off."
+
+    var controlAvailable: Bool {
+        let current = snapshot()
+        return port != nil && current.state.ready && current.image != nil && current.connectionID != nil
+    }
+
+    var controlEnabled: Bool {
+        let current = snapshot()
+        return port != nil && current.state.ready && current.image != nil && controlConnectionID != nil &&
+            controlConnectionID == current.connectionID
+    }
+
+    private var inputTask: Task<Void, Never>?
+    private var inputHandle: VNCInputHandle?
+    private var inputRequestID: Data?
+    private var inputConnection: MCPHTTPConnection?
 
     var didChange: (() -> Void)?
     private(set) var token: String?
@@ -40,8 +60,44 @@ final class MCPServer {
     private var screenshotConnection: MCPHTTPConnection?
     private var nextScreenshot: TimeInterval = 0
 
-    init(snapshot: @escaping () -> MCPDesktopSnapshot) {
+    init(
+        snapshot: @escaping () -> MCPDesktopSnapshot,
+        submitInput: @escaping (VNCInputPlan) throws -> VNCInputHandle
+    ) {
         self.snapshot = snapshot
+        self.submitInput = submitInput
+    }
+
+    // Permission is bound to the connection that was visible when enabled.
+    // It never carries over to a new VNC connection or a new server run.
+    func setControlEnabled(_ enabled: Bool) {
+        guard enabled else {
+            revokeControl(reason: "Disabled in the viewer.")
+            return
+        }
+        guard controlAvailable, inputHandle == nil else {
+            controlStatus = "Control off. Wait for a connected desktop and any pending input release."
+            didChange?()
+            return
+        }
+        controlConnectionID = snapshot().connectionID
+        controlStatus = "Control enabled. Local input takes over; pointer movement alone does not."
+        didChange?()
+    }
+
+    func revokeControl(reason: String) {
+        controlConnectionID = nil
+        inputHandle?.cancel(reason: reason)
+        controlStatus = "Control off. " + reason
+        didChange?()
+    }
+
+    func connectionDidChange() {
+        if controlConnectionID != nil && !controlEnabled {
+            revokeControl(reason: "The VNC connection ended or changed.")
+        } else {
+            didChange?()
+        }
     }
 
     // MARK: - Explicit server lifecycle
@@ -81,7 +137,7 @@ final class MCPServer {
                         self.port = port
                         self.startDeadline?.cancel()
                         self.startDeadline = nil
-                        self.status = "Running · this Mac only · screenshots and status"
+                        self.status = "Running · this Mac only"
                         self.didChange?()
 
                     case .failed:
@@ -144,6 +200,7 @@ final class MCPServer {
     }
 
     func stop() {
+        revokeControl(reason: "MCP server stopped.")
         runID = UUID() // Invalidates callbacks and encoded images from this run.
         startDeadline?.cancel()
         startDeadline = nil
@@ -345,12 +402,18 @@ final class MCPServer {
                let cancelledID = parameters["requestId"],
                let encodedID = try? JSONSerialization.data(
                    withJSONObject: cancelledID, options: [.fragmentsAllowed]
-               ),
-               encodedID == screenshotRequestID {
-                screenshotTask?.cancel()
-                screenshotRequestID = nil
-                screenshotConnection?.close()
-                screenshotConnection = nil
+               ) {
+                if encodedID == screenshotRequestID {
+                    screenshotTask?.cancel()
+                    screenshotRequestID = nil
+                    screenshotConnection?.close()
+                    screenshotConnection = nil
+                }
+                if encodedID == inputRequestID {
+                    // Keep observing the worker until its releases complete.
+                    inputHandle?.cancel(reason: "Cancelled by the MCP client.")
+                    inputConnection?.close()
+                }
             }
             client.respond(status: "202 Accepted")
             return
@@ -373,8 +436,10 @@ final class MCPServer {
                 "protocolVersion": negotiatedVersion,
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "sharedesk-viewer", "version": "0.1-experimental"],
-                "instructions": "Read-only access to the viewer's current remote desktop. " +
-                    "Screenshots may contain sensitive information. No input, clipboard or connection control."
+                "instructions": "Access to the viewer's current remote desktop. Screenshots may contain sensitive information. " +
+                    "Input requires the viewer's Allow MCP Control switch. Use target from current status or screenshot metadata. " +
+                    "Pointer coordinates are full remote pixels; scale resized PNG coordinates using its metadata. " +
+                    "Input can perform destructive actions as the logged-in Ubuntu user. No clipboard or connection-control tools."
             ])
 
         case "ping":
@@ -411,7 +476,7 @@ final class MCPServer {
                     ]
                 ] as [String: Any]
             }
-            sendRPCResult(client, id: requestID, result: ["tools": tools])
+            sendRPCResult(client, id: requestID, result: ["tools": tools + MCPControl.tools])
 
         case "tools/call":
             guard let toolName = parameters["name"] as? String, parameters["task"] == nil else {
@@ -421,6 +486,63 @@ final class MCPServer {
                 )
                 return
             }
+            if MCPControl.names.contains(toolName) {
+                guard controlEnabled else {
+                    sendToolError(client, id: requestID, message: "MCP control is off. Enable Allow MCP Control in the viewer.")
+                    return
+                }
+                guard inputTask == nil else {
+                    sendToolError(client, id: requestID, message: "Another input action is running or releasing input.")
+                    return
+                }
+                guard let arguments = parameters["arguments"] as? [String: Any] else {
+                    sendToolError(client, id: requestID, message: "Input tools require arguments including the current target.")
+                    return
+                }
+
+                let handle: VNCInputHandle
+                do {
+                    let plan = try MCPControl.plan(tool: toolName, arguments: arguments)
+                    guard plan.target.connectionID == controlConnectionID else {
+                        throw VNCInputError(message: "The target connection changed. Get a current screenshot or status.")
+                    }
+                    handle = try submitInput(plan)
+                } catch {
+                    sendToolError(client, id: requestID, message: error.localizedDescription)
+                    return
+                }
+                let currentRunID = runID
+                inputHandle = handle
+                inputRequestID = try! JSONSerialization.data(
+                    withJSONObject: requestID, options: [.fragmentsAllowed]
+                )
+                inputConnection = client
+                inputTask = Task { [weak self] in
+                    // Observe content-free completion; all socket writes and
+                    // pacing remain on the existing blocking VNC worker.
+                    var outcome = handle.outcome()
+                    while outcome == nil {
+                        try? await Task.sleep(nanoseconds: 10_000_000)
+                        outcome = handle.outcome()
+                    }
+                    guard let self, let outcome else { return }
+                    self.inputTask = nil
+                    self.inputHandle = nil
+                    self.inputRequestID = nil
+                    self.inputConnection = nil
+                    self.didChange?()
+                    guard self.runID == currentRunID, !client.closed else { return }
+
+                    let failed: Bool
+                    if case .sent = outcome { failed = false } else { failed = true }
+                    self.sendRPCResult(client, id: requestID, result: [
+                        "content": [["type": "text", "text": outcome.message]],
+                        "isError": failed
+                    ])
+                }
+                return
+            }
+
             let argumentsAbsent = parameters["arguments"] == nil
             let argumentsEmpty = (parameters["arguments"] as? [String: Any])?.isEmpty == true
             guard argumentsAbsent || argumentsEmpty else {
@@ -443,7 +565,12 @@ final class MCPServer {
                     "state": stateName,
                     "width": image.map { $0.width as Any } ?? NSNull(),
                     "height": image.map { $0.height as Any } ?? NSNull(),
-                    "screenshotAvailable": image != nil
+                    "screenshotAvailable": image != nil,
+                    "controlEnabled": controlEnabled,
+                    "target": image.flatMap { image -> [String: Any]? in
+                        guard let id = current.connectionID else { return nil }
+                        return ["connection_id": id.uuidString, "width": image.width, "height": image.height]
+                    } as Any? ?? NSNull()
                 ]
                 let statusData = try! JSONSerialization.data(
                     withJSONObject: connectionStatus, options: [.sortedKeys]
@@ -482,7 +609,7 @@ final class MCPServer {
                     // serialization never execute on the UI or VNC thread.
                     let response = await Task.detached(priority: .utility) {
                         autoreleasepool {
-                            Self.encodeScreenshot(image, id: encodedID)
+                            Self.encodeScreenshot(image, id: encodedID, connectionID: connectionID)
                         }
                     }.value
 
@@ -523,7 +650,7 @@ final class MCPServer {
 
     // MARK: - Off-thread screenshot encoding
 
-    private nonisolated static func encodeScreenshot(_ image: CGImage, id: Data) -> Data? {
+    private nonisolated static func encodeScreenshot(_ image: CGImage, id: Data, connectionID: UUID) -> Data? {
         let scale = min(1, 1600 / Double(max(image.width, image.height)))
         let width = max(1, Int(Double(image.width) * scale))
         let height = max(1, Int(Double(image.height) * scale))
@@ -551,12 +678,19 @@ final class MCPServer {
         CGImageDestinationAddImage(destination, scaledImage, nil)
         guard CGImageDestinationFinalize(destination), png.length <= 8 * 1024 * 1024 else { return nil }
 
+        let metadata: [String: Any] = [
+            "target": ["connection_id": connectionID.uuidString, "width": image.width, "height": image.height],
+            "image_width": width,
+            "image_height": height
+        ]
+        guard let metadataData = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]),
+              let metadataText = String(data: metadataData, encoding: .utf8) else { return nil }
         let result: [String: Any] = [
             "content": [
                 [
                     "type": "text",
                     "text": "Latest received remote framebuffer: \(image.width) × \(image.height); " +
-                        "PNG: \(width) × \(height)."
+                        "PNG: \(width) × \(height). Pointer coordinates use the full remote size.\n" + metadataText
                 ],
                 [
                     "type": "image",

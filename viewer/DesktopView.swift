@@ -203,12 +203,19 @@ final class DesktopView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if locate(event, clamp: buttons != 0) { session?.sendPointer(x: lastX, y: lastY, buttons: buttons) }
+        if event.type == .mouseMoved && controller?.mcpControlEnabled == true {
+            return // Hover neither takes over nor interferes with an automated drag.
+        }
+        if locate(event, clamp: buttons != 0) {
+            controller?.takeOverMCPControl()
+            session?.sendPointer(x: lastX, y: lastY, buttons: buttons)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         guard locate(event, clamp: false) else { return }
+        controller?.takeOverMCPControl()
         controller?.syncClipboard(force: false) // Clipboard precedes mouse-driven paste.
         let bit: UInt8 = switch event.buttonNumber { case 0: 1; case 1: 4; case 2: 2; default: 0 }
         syncModifiers(event)
@@ -218,6 +225,7 @@ final class DesktopView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         guard locate(event, clamp: true) else { return }
+        controller?.takeOverMCPControl()
         let bit: UInt8 = switch event.buttonNumber { case 0: 1; case 1: 4; case 2: 2; default: 0 }
         buttons &= ~bit
         session?.sendPointer(x: lastX, y: lastY, buttons: buttons)
@@ -233,6 +241,7 @@ final class DesktopView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard locate(event, clamp: false) else { return }
+        controller?.takeOverMCPControl()
         let divisor: CGFloat = event.hasPreciseScrollingDeltas ? 10 : 1
         scrollY = max(-10, min(10, scrollY + event.scrollingDeltaY / divisor))
         scrollX = max(-10, min(10, scrollX + event.scrollingDeltaX / divisor))
@@ -269,11 +278,15 @@ final class DesktopView: NSView {
         }
     }
 
-    override func flagsChanged(with event: NSEvent) { syncModifiers(event) }
+    override func flagsChanged(with event: NSEvent) {
+        if inputEnabled { controller?.takeOverMCPControl() }
+        syncModifiers(event)
+    }
 
     override func keyDown(with event: NSEvent) {
         let code = Int(event.keyCode)
         guard inputEnabled, code < heldKeys.count, !event.isARepeat, heldKeys[code] == 0 else { return }
+        controller?.takeOverMCPControl()
         controller?.syncClipboard(force: false) // Clipboard precedes paste keys.
         syncModifiers(event)
         var symbol: UInt32 = switch code {
@@ -319,6 +332,7 @@ final class DesktopView: NSView {
     override func keyUp(with event: NSEvent) {
         let code = Int(event.keyCode)
         guard inputEnabled, code < heldKeys.count, heldKeys[code] != 0 else { return }
+        controller?.takeOverMCPControl()
         session?.sendKey(heldKeys[code], down: false)
         heldKeys[code] = 0
     }

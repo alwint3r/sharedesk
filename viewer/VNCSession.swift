@@ -106,7 +106,7 @@ final class VNCSession: @unchecked Sendable {
     private let lock = NSLock()
     private var state: SessionState = .connecting
     private var established = false // Lifecycle history, under lock; no credentials retained.
-    private let statisticsID = UUID()
+    private let sessionID = UUID()
     private var connectedAt: TimeInterval?
     private var endedAt: TimeInterval?
     private var framebufferInfo = SDVNCFramebufferInfo()
@@ -119,6 +119,7 @@ final class VNCSession: @unchecked Sendable {
     private var pendingClipboardError: String?
     private var packets: [Data] = []
     private var queuedBytes = 0
+    private var inputAction: VNCInputAction? // One bounded action; same lock and worker as ordinary input.
     private var pendingFrame: PixelFrame?
     private var pendingCursor: RemoteCursor?
     private var pendingClipboard: Data?
@@ -146,17 +147,76 @@ final class VNCSession: @unchecked Sendable {
     }
 
     func sendKey(_ symbol: UInt32, down: Bool) {
-        var packet = Data([4, down ? 1 : 0, 0, 0])
-        withUnsafeBytes(of: symbol.bigEndian) { packet.append(contentsOf: $0) }
-        enqueue(packet)
+        enqueue(VNCInputEvent.key(symbol, down: down).packet)
     }
 
     func sendPointer(x: Int, y: Int, buttons: UInt8) {
         guard (0...65535).contains(x), (0...65535).contains(y) else { return }
-        var packet = Data([5, buttons])
-        withUnsafeBytes(of: UInt16(x).bigEndian) { packet.append(contentsOf: $0) }
-        withUnsafeBytes(of: UInt16(y).bigEndian) { packet.append(contentsOf: $0) }
-        enqueue(packet)
+        enqueue(VNCInputEvent.pointer(x: x, y: y, buttons: buttons).packet)
+    }
+
+    // Submission and observation are nonblocking. Only run() writes these
+    // events. A returned handle reports sent/cancelled, not application success.
+    func beginInputAction(_ plan: VNCInputPlan) throws -> VNCInputHandle {
+        try lock.withLock {
+            guard state.ready, stopReason == nil, plan.target.connectionID == sessionID else {
+                throw VNCInputError(message: "The target connection is no longer ready. Nothing was sent.")
+            }
+            guard plan.target.width == Int(framebufferInfo.width),
+                  plan.target.height == Int(framebufferInfo.height) else {
+                throw VNCInputError(message: "The desktop size changed. Get a new screenshot or status before acting.")
+            }
+            guard inputAction == nil || inputAction?.outcome != nil else {
+                throw VNCInputError(message: "Another input action is still running or releasing input.")
+            }
+            guard (1...512).contains(plan.steps.count),
+                  plan.steps.reduce(0, { $0 + $1.events.count }) <= 1024,
+                  plan.steps.allSatisfy({ step in
+                      !step.events.isEmpty && step.events.count <= 16 &&
+                      step.delayAfter.isFinite && (0...1).contains(step.delayAfter) &&
+                      step.events.allSatisfy { event in
+                          switch event {
+                          case .key(let symbol, _): return symbol != 0
+                          case .pointer(let x, let y, let buttons):
+                              return (0..<plan.target.width).contains(x) &&
+                                  (0..<plan.target.height).contains(y) && buttons < 128
+                          }
+                      }
+                  }),
+                  plan.steps.reduce(0, { $0 + $1.delayAfter }) <= 5 else {
+                throw VNCInputError(message: "The input plan exceeds its event, timing or coordinate bounds.")
+            }
+            let action = VNCInputAction(
+                target: plan.target,
+                steps: plan.steps,
+                deadline: ProcessInfo.processInfo.systemUptime + 5
+            )
+            inputAction = action
+            if ioDeadline > 0 { ioDeadline = min(ioDeadline, action.deadline) }
+            return VNCInputHandle(id: action.id, session: self)
+        }
+    }
+
+    func cancelInputAction(id: UUID, reason: String) {
+        lock.withLock {
+            guard var action = inputAction, action.id == id, action.outcome == nil else { return }
+            if action.cancellationReason == nil {
+                action.cancellationReason = reason
+            }
+            let releaseDeadline = ProcessInfo.processInfo.systemUptime + 1
+            action.deadline = min(action.deadline, releaseDeadline)
+            inputAction = action
+            if ioDeadline > 0 { ioDeadline = min(ioDeadline, releaseDeadline) }
+        }
+    }
+
+    func inputOutcome(id: UUID) -> VNCInputOutcome? {
+        lock.withLock {
+            guard inputAction?.id == id else {
+                return .cancelled("The action handle is no longer current.")
+            }
+            return inputAction?.outcome
+        }
     }
 
     @discardableResult func sendClipboard(_ text: String) -> ClipboardSendStatus {
@@ -241,7 +301,7 @@ final class VNCSession: @unchecked Sendable {
     // Non-consuming identity/lifecycle read for MCP. No socket sampling,
     // framebuffer retention or extra VNC worker/connection.
     func connectionStatus() -> (id: UUID, state: SessionState) {
-        lock.withLock { (statisticsID, state) }
+        lock.withLock { (sessionID, state) }
     }
 
     // Called when the panel opens, then once per second while it is visible.
@@ -259,7 +319,7 @@ final class VNCSession: @unchecked Sendable {
                     receivedBytes = info.tcpi_rxbytes
                 }
             }
-            return SessionStatistics(id: statisticsID, sampledAt: ProcessInfo.processInfo.systemUptime, state: state,
+            return SessionStatistics(id: sessionID, sampledAt: ProcessInfo.processInfo.systemUptime, state: state,
                                      width: Int(framebufferInfo.width), height: Int(framebufferInfo.height),
                                      framebufferUpdates: framebufferInfo.updates, receivedBytes: receivedBytes,
                                      connectedAt: connectedAt, endedAt: endedAt,
@@ -268,7 +328,14 @@ final class VNCSession: @unchecked Sendable {
     }
 
     private func beginIO(timeout: TimeInterval) {
-        lock.withLock { ioDeadline = ProcessInfo.processInfo.systemUptime + timeout }
+        lock.withLock {
+            ioDeadline = ProcessInfo.processInfo.systemUptime + timeout
+            if let action = inputAction, action.outcome == nil {
+                // If a partial VNC message prevents releases, the UI's existing
+                // deadline check disconnects rather than leaving input held.
+                ioDeadline = min(ioDeadline, action.deadline)
+            }
+        }
     }
 
     private func endIO() {
@@ -309,11 +376,79 @@ final class VNCSession: @unchecked Sendable {
                 return true
             }
             while healthy && connected {
-                let batch: (stopping: Bool, packets: [Data]) = lock.withLock {
-                    let batch = (stopReason != nil, packets)
+                let batch: (stopping: Bool, packets: [Data], completion: (UUID, VNCInputOutcome)?) = lock.withLock {
+                    var outgoing = packets
                     packets = []
                     queuedBytes = 0
-                    return batch
+                    var completion: (UUID, VNCInputOutcome)?
+
+                    if stopReason == nil, var action = inputAction, action.outcome == nil {
+                        let now = ProcessInfo.processInfo.systemUptime
+                        let ending: VNCInputOutcome?
+                        if let reason = action.cancellationReason {
+                            ending = .cancelled(reason)
+                        } else if action.target.width != Int(framebufferInfo.width) ||
+                                    action.target.height != Int(framebufferInfo.height) {
+                            ending = .desktopChanged
+                        } else if now >= action.deadline {
+                            ending = .timedOut
+                        } else if action.nextStep == action.steps.count {
+                            ending = .sent
+                        } else {
+                            ending = nil
+                        }
+
+                        if let ending {
+                            var releases = Data()
+                            for symbol in action.heldKeys.reversed() {
+                                releases.append(VNCInputEvent.key(symbol, down: false).packet)
+                            }
+                            if action.buttons != 0 {
+                                let x = min(action.pointerX, max(0, Int(framebufferInfo.width) - 1))
+                                let y = min(action.pointerY, max(0, Int(framebufferInfo.height) - 1))
+                                releases.append(VNCInputEvent.pointer(x: x, y: y, buttons: 0).packet)
+                            }
+                            action.heldKeys.removeAll()
+                            action.buttons = 0
+                            action.steps.removeAll() // Do not retain typed text after completion.
+                            if releases.isEmpty {
+                                action.outcome = ending
+                            } else {
+                                // Local takeover must release automated input
+                                // BEFORE forwarding any queued local keys/buttons.
+                                if case .timedOut = ending {
+                                    action.deadline = now + 1
+                                } else {
+                                    action.deadline = min(action.deadline, now + 1)
+                                }
+                                outgoing.insert(releases, at: 0)
+                                completion = (action.id, ending)
+                            }
+                        } else if now >= action.nextStepAt {
+                            let step = action.steps[action.nextStep]
+                            var packet = Data()
+                            for event in step.events {
+                                packet.append(event.packet)
+                                switch event {
+                                case .key(let symbol, let down):
+                                    if down && !action.heldKeys.contains(symbol) {
+                                        action.heldKeys.append(symbol)
+                                    } else if !down {
+                                        action.heldKeys.removeAll { $0 == symbol }
+                                    }
+                                case .pointer(let x, let y, let buttons):
+                                    action.pointerX = x
+                                    action.pointerY = y
+                                    action.buttons = buttons
+                                }
+                            }
+                            action.nextStep += 1
+                            action.nextStepAt = now + step.delayAfter
+                            outgoing.append(packet)
+                        }
+                        inputAction = action
+                    }
+                    return (stopReason != nil, outgoing, completion)
                 }
                 if batch.stopping { break }
                 for packet in batch.packets {
@@ -347,6 +482,13 @@ final class VNCSession: @unchecked Sendable {
                     endIO()
                     if !healthy { break }
                 }
+                if let (id, outcome) = batch.completion {
+                    lock.withLock {
+                        if inputAction?.id == id {
+                            inputAction?.outcome = healthy && stopReason == nil ? outcome : .connectionEnded
+                        }
+                    }
+                }
                 if !healthy { break }
                 let ready = sd_vnc_wait(client, 10_000)
                 if ready < 0 { healthy = false }
@@ -369,6 +511,12 @@ final class VNCSession: @unchecked Sendable {
         lock.withLock {
             state = .finished(stopReason ?? (connected ? .connectionClosed : .setupFailed))
             endedAt = ProcessInfo.processInfo.systemUptime
+            if inputAction?.outcome == nil {
+                inputAction?.outcome = .connectionEnded
+            }
+            inputAction?.steps.removeAll()
+            inputAction?.heldKeys.removeAll()
+            inputAction?.buttons = 0
             // Retain the negotiated mode for the last-session summary, not text.
             pendingClipboardError = nil
             packets = []

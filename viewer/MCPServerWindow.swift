@@ -13,16 +13,19 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     private let startButton = NSButton(title: "Start Server", target: nil, action: nil)
     private let tokenButton = NSButton(title: "Copy Token", target: nil, action: nil)
     private let configButton = NSButton(title: "Copy Client Config", target: nil, action: nil)
+    private let controlButton = NSButton(checkboxWithTitle: "Allow MCP Control", target: nil, action: nil)
+    private let controlStatus = NSTextField(wrappingLabelWithString: "Control off.")
 
     init(
         snapshot: @escaping () -> MCPDesktopSnapshot,
+        submitInput: @escaping (VNCInputPlan) throws -> VNCInputHandle,
         copyLocal: @escaping (String) -> Bool
     ) {
-        self.server = MCPServer(snapshot: snapshot)
+        self.server = MCPServer(snapshot: snapshot, submitInput: submitInput)
         self.copyLocal = copyLocal
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 375),
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 470),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -35,14 +38,15 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         super.init(window: panel)
         panel.delegate = self
 
-        let heading = NSTextField(labelWithString: "Read-only access to the remote desktop")
+        let heading = NSTextField(labelWithString: "Access to the remote desktop")
         heading.font = .systemFont(ofSize: 15, weight: .semibold)
 
         let privacyNotice = NSTextField(wrappingLabelWithString:
             "A trusted MCP client on this Mac can read connection status and take screenshots " +
             "of the current Ubuntu desktop. Screenshots may contain sensitive information. " +
             "The client may store them or send them to its AI provider.\n\n" +
-            "No keyboard, mouse, clipboard or connection-control tools."
+            "Input is off by default. If enabled below, clients can act with your Ubuntu user's permissions, " +
+            "including destructive actions. No clipboard or connection-control tools."
         )
         privacyNotice.font = .systemFont(ofSize: 12)
         statusField.font = .systemFont(ofSize: 12, weight: .medium)
@@ -75,17 +79,22 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         lifecycleNotice.textColor = .secondaryLabelColor
         copyStatus.font = .systemFont(ofSize: 11)
         copyStatus.textColor = .secondaryLabelColor
+        controlButton.target = self
+        controlButton.action = #selector(changeControlPermission(_:))
+        controlButton.toolTip = "Allow bounded mouse and keyboard actions for this connection only. Local clicks, scrolling or keys revoke control."
+        controlStatus.font = .systemFont(ofSize: 11)
+        controlStatus.textColor = .secondaryLabelColor
 
         let stack = NSStackView(views: [
             heading, privacyNotice, statusField, endpointField,
-            lifecycleNotice, buttons, copyStatus
+            controlButton, controlStatus, lifecycleNotice, buttons, copyStatus
         ])
         stack.orientation = .vertical
         stack.distribution = .fill
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for field in [privacyNotice, statusField, lifecycleNotice, copyStatus] {
+        for field in [privacyNotice, statusField, controlStatus, lifecycleNotice, copyStatus] {
             field.widthAnchor.constraint(equalToConstant: 540).isActive = true
         }
 
@@ -115,6 +124,13 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         tokenButton.isEnabled = server.endpoint != nil
         configButton.isEnabled = server.endpoint != nil
         copyStatus.stringValue = ""
+        controlButton.isEnabled = server.controlAvailable
+        controlButton.state = server.controlEnabled ? .on : .off
+        controlStatus.stringValue = server.controlStatus
+    }
+
+    @objc private func changeControlPermission(_ sender: Any?) {
+        server.setControlEnabled(controlButton.state == .on)
     }
 
     @objc private func toggleServer(_ sender: Any?) {
