@@ -97,7 +97,7 @@ final class MCPAuthorization {
             let fresh = MCPAuthorizationState(signingKey: try randomBytes(), grants: [])
             try MCPAuthorizationStore.save(fresh)
             authorizationState = fresh
-            status = "All previous sign-ins revoked. In Pi, use /mcp login sharedesk and approve again here."
+            status = "All previous sign-ins revoked. Sign in again from your MCP client and approve here."
             didChange?()
         } catch {
             failClosed(error)
@@ -117,7 +117,7 @@ final class MCPAuthorization {
             pending.decision = false
         } else {
             pending.decision = allow
-            status = allow ? "Approved. Waiting for Pi to finish sign-in." : "Sign-in denied."
+            status = allow ? "Approved. Waiting for the client to finish sign-in." : "Sign-in denied."
         }
         approval = pending
         didChange?()
@@ -309,7 +309,7 @@ final class MCPAuthorization {
                 }
                 self.approval = nil
                 self.approvalTimer = nil
-                self.status = "Sign-in expired. Run /mcp login sharedesk to try again."
+                self.status = "Sign-in expired. Start sign-in again from your MCP client."
                 self.didChange?()
             }
             didChange?()
@@ -328,13 +328,13 @@ final class MCPAuthorization {
               var pending = approval,
               ticket == pending.ticket,
               pending.deadline > ProcessInfo.processInfo.systemUptime else {
-            sendHTML("This sign-in expired or was cancelled. Return to Pi and sign in again.", to: client)
+            sendHTML("This sign-in expired or was cancelled. Return to your MCP client and sign in again.", to: client)
             return
         }
         guard let isApproved = pending.decision else {
             sendHTML(
                 "Compare this code with Sharedesk: <strong>\(pending.displayCode)</strong>. " +
-                "In Sharedesk → MCP Server, approve only if you started this Pi sign-in. " +
+                "In Sharedesk → MCP Server, approve only if you started this sign-in in your MCP client. " +
                 "Approval remembers access for up to 30 days, including future server starts. " +
                 "Desktop control still needs its separate local switch. This page will continue automatically.",
                 to: client, refresh: true
@@ -481,7 +481,7 @@ final class MCPAuthorization {
                 do {
                     try MCPAuthorizationStore.save(updatedState)
                     authorizationState = updatedState
-                    status = "An old refresh token was reused. That sign-in was revoked; sign in again in Pi."
+                    status = "An old refresh token was reused. That sign-in was revoked; sign in again from your MCP client."
                     didChange?()
                     sendError("invalid_grant", to: client)
                 } catch {
@@ -516,7 +516,7 @@ final class MCPAuthorization {
                 using: SymmetricKey(data: updatedState.signingKey)
             )
             let refreshToken = "\(grant.id.uuidString).\(grant.generation).\(base64URL(Data(signature)))"
-            status = "Pi authorized. Control still needs local permission."
+            status = "Client authorized. Control still needs local permission."
             didChange?()
             sendJSON([
                 "access_token": accessToken,

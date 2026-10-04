@@ -1,7 +1,7 @@
 import AppKit
 
 // Closing this window stops access. Sign-in approval is native-only; the
-// browser cannot grant it. The copied Pi configuration contains no secret.
+// browser cannot grant it. The copied client configuration contains no secret.
 @MainActor
 final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     let server: MCPServer
@@ -85,9 +85,9 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         approvalField.setAccessibilityLabel("Pending MCP sign-in")
 
         let lifecycleNotice = NSTextField(wrappingLabelWithString:
-            "Off each launch. Configure Pi once, then use /mcp login sharedesk. Compare the browser's " +
-            "code here before approving. The public client ID is not proof that the requester is Pi.\n\n" +
-            "Approvals are kept in Keychain for up to 30 days. Pi refreshes short-lived tokens automatically. " +
+            "Off each launch. Configure your MCP client once, then use its sign-in action. Compare the browser's " +
+            "code here before approving. A public client ID does not verify the requesting application's identity.\n\n" +
+            "Approvals are kept in Keychain for up to 30 days. Clients can refresh short-lived tokens automatically. " +
             "Stop or closing this window ends current access, but approved clients can return on the next Start. " +
             "Require Sign-In Again revokes remembered access without changing the URL."
         )
@@ -166,7 +166,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         guard let code = server.authorization.pendingApprovalCode, let window else { return }
         let alert = NSAlert()
         alert.messageText = "Authorize this sign-in for up to 30 days?"
-        alert.informativeText = "Approve only if you started sign-in in Pi and its browser shows \(code). " +
+        alert.informativeText = "Approve only if you started sign-in in your MCP client and the browser shows \(code). " +
             "The client can read screenshots whenever you start this server, including future VNC connections. " +
             "Screenshots may reach its AI provider. Input also requires Allow MCP Control."
         alert.addButton(withTitle: "Cancel")
@@ -188,7 +188,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         let alert = NSAlert()
         alert.messageText = "Revoke every remembered MCP sign-in?"
         alert.informativeText = "This turns control off, cancels unfinished MCP actions and invalidates all client credentials. " +
-            "The VNC connection stays open. In Pi, use /mcp login sharedesk to authorize again. Its configuration does not change."
+            "The VNC connection stays open. Sign in again from your MCP client. Its configuration does not change."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Revoke Sign-Ins")
         alert.beginSheetModal(for: window) { [weak self] response in
