@@ -2,7 +2,6 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import Network
-import Security
 import UniformTypeIdentifiers
 
 struct MCPDesktopSnapshot {
@@ -39,7 +38,7 @@ final class MCPServer {
     private var inputConnection: MCPHTTPConnection?
 
     var didChange: (() -> Void)?
-    private(set) var token: String?
+    let authorization = MCPAuthorization()
     private(set) var port: UInt16?
     private(set) var status = "Stopped. No MCP access."
 
@@ -66,6 +65,23 @@ final class MCPServer {
     ) {
         self.snapshot = snapshot
         self.submitInput = submitInput
+        authorization.didChange = { [weak self] in self?.didChange?() }
+        authorization.didRevokeAccess = { [weak self] reportingConnection in
+            guard let self else { return }
+            self.revokeControl(reason: "MCP authorization revoked.")
+            self.screenshotTask?.cancel()
+            self.screenshotRequestID = nil
+            self.screenshotConnection = nil
+            for client in Array(self.connections.values) where client.id != reportingConnection {
+                client.close()
+            }
+        }
+        authorization.didFail = { [weak self] message in
+            guard let self else { return }
+            self.stop()
+            self.status = message
+            self.didChange?()
+        }
     }
 
     // Permission is bound to the connection that was visible when enabled.
@@ -105,24 +121,18 @@ final class MCPServer {
     func start() {
         guard listener == nil else { return }
 
-        var randomBytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes) == errSecSuccess else {
-            status = "Could not create a secure temporary token. Server remains stopped."
-            didChange?()
-            return
-        }
-
         let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: MCPAuthorization.port)!
+        )
         parameters.allowLocalEndpointReuse = false
 
         do {
             let listener = try NWListener(using: parameters)
             self.listener = listener
-            token = Data(randomBytes).base64EncodedString()
             let currentRunID = UUID()
             runID = currentRunID
-            status = "Starting on 127.0.0.1…"
+            status = "Starting on 127.0.0.1:\(MCPAuthorization.port)…"
 
             listener.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor in
@@ -134,15 +144,29 @@ final class MCPServer {
                             self.stop()
                             return
                         }
-                        self.port = port
                         self.startDeadline?.cancel()
                         self.startDeadline = nil
+                        // Own the fixed port before accessing Keychain. A
+                        // second viewer must never load or mutate this authority.
+                        do {
+                            try self.authorization.start()
+                        } catch {
+                            self.stop()
+                            self.status = error.localizedDescription + " Server remains stopped."
+                            self.didChange?()
+                            return
+                        }
+                        guard self.runID == currentRunID, self.listener != nil else {
+                            self.authorization.stop()
+                            return
+                        }
+                        self.port = port
                         self.status = "Running · this Mac only"
                         self.didChange?()
 
                     case .failed:
                         self.stop()
-                        self.status = "Could not run the loopback server. Try Start again."
+                        self.status = "Could not bind 127.0.0.1:\(MCPAuthorization.port). Another viewer or app may be using it. No alternate port was chosen."
                         self.didChange?()
 
                     default:
@@ -208,7 +232,7 @@ final class MCPServer {
         listener?.newConnectionHandler = nil
         listener?.cancel()
         listener = nil
-        token = nil
+        authorization.stop()
         port = nil
 
         for client in Array(connections.values) {
@@ -221,14 +245,14 @@ final class MCPServer {
         screenshotTask?.cancel()
         screenshotRequestID = nil
         screenshotConnection = nil
-        status = "Stopped. No MCP access. Previous token is invalid."
+        status = "Stopped. No MCP access until Start; remembered sign-ins are retained."
         didChange?()
     }
 
     // MARK: - HTTP access checks
 
     private func authorizeRequest(_ request: MCPHTTPRequest, client: MCPHTTPConnection) -> Bool {
-        guard let port, let token else {
+        guard let port else {
             client.close()
             return false
         }
@@ -243,26 +267,11 @@ final class MCPServer {
             return false
         }
 
-        // Compare every byte when lengths match. Token contents must not
-        // determine how early the comparison returns.
-        let expectedAuthorization = Array("Bearer \(token)".utf8)
-        let receivedAuthorization = Array((request.headers["authorization"] ?? "").utf8)
-        var difference: UInt8 = 0
-        if receivedAuthorization.count == expectedAuthorization.count {
-            for index in expectedAuthorization.indices {
-                difference |= expectedAuthorization[index] ^ receivedAuthorization[index]
-            }
+        if request.path != "/mcp" {
+            return authorization.authorizeRoute(request, client: client)
         }
-        guard receivedAuthorization.count == expectedAuthorization.count, difference == 0 else {
-            client.respond(
-                status: "401 Unauthorized",
-                extra: "WWW-Authenticate: Bearer realm=\"Sharedesk\"\r\n"
-            )
-            return false
-        }
-
-        guard request.path == "/mcp" else {
-            client.respond(status: "404 Not Found")
+        guard authorization.accepts(request.headers["authorization"]) else {
+            authorization.challenge(client)
             return false
         }
         if let version = request.headers["mcp-protocol-version"], !supportedVersions.contains(version) {
@@ -351,6 +360,15 @@ final class MCPServer {
     // MARK: - MCP request dispatch
 
     private func handleRequest(_ request: MCPHTTPRequest, client: MCPHTTPConnection) {
+        if request.path != "/mcp" {
+            authorization.handle(request, client: client)
+            return
+        }
+        // Recheck after body receipt: the token may have expired while reading.
+        guard authorization.accepts(request.headers["authorization"]) else {
+            authorization.challenge(client)
+            return
+        }
         guard String(data: request.body, encoding: .utf8) != nil, !request.body.contains(0) else {
             sendRPCError(
                 client, id: NSNull(), code: -32700,

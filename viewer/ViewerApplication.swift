@@ -23,7 +23,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var statisticsButton: NSButton!
     private var statisticsWindow: ConnectionStatistics?
     private var mcpWindow: MCPServerWindow?
-    private var privatePasteboardChange: Int? // Local MCP credential copy; never export, even with Send Clipboard.
+    private var privatePasteboardChange: Int? // Local MCP configuration copy; never export, even with Send Clipboard.
     private var lastSessionStatistics: SessionStatistics?
     private var lastDisconnect: SessionEnd?
     private var nextStatisticsRefresh: TimeInterval = 0
@@ -385,7 +385,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
         let written = pasteboard.writeObjects([item])
         // Atomic with the write on MainActor: input and timer-driven sync
-        // cannot observe a secret copy before its suppression baseline.
+        // cannot observe this local-only copy before its suppression baseline.
         pasteboardChange = pasteboard.changeCount
         privatePasteboardChange = pasteboardChange
         return written
@@ -693,7 +693,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard ready, clipboardButton.state == .on else { return }
         let change = pasteboard.changeCount
         if change == privatePasteboardChange {
-            if force { showStatus("MCP credentials are local-only and cannot be sent to Ubuntu. Copy other text first.") }
+            if force { showStatus("MCP configuration is local-only and cannot be sent to Ubuntu. Copy other text first.") }
             return
         }
         privatePasteboardChange = nil

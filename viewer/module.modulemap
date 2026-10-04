@@ -2,3 +2,8 @@ module SharedeskVNC {
     header "VNCBridge.h"
     export *
 }
+
+module SharedeskMCPKeychain {
+    header "MCPKeychain.h"
+    export *
+}

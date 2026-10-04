@@ -148,13 +148,44 @@ These are content-free, in-memory counters. There are no statistics logs, export
 
 ### Experimental MCP access and control
 
-On `experiment/mcp-http-sse`, the viewer can serve its **current VNC connection** to a trusted MCP client on the same Mac. It does not open another VNC connection or change the Ubuntu host. Use **Sharedesk → MCP Server… → Start Server**. The server starts read-only and listens only on a system-selected **127.0.0.1** port.
+On `experiment/mcp-http-sse`, the viewer can serve its **current VNC connection** to Pi on the same Mac. It does not open another VNC connection or change the Ubuntu host. Use **Sharedesk → MCP Server… → Start Server**. The server starts with control off and listens only at **`http://127.0.0.1:5917/mcp`**. If port 5917 is occupied, Start fails with a message; it never selects another port or stops the other process.
 
-Use **Copy Client Config** to obtain the current `/mcp` URL and `Authorization: Bearer …` header. The copied example uses an `mcpServers` object with a `sharedesk` entry containing `type: "http"`, `url` and `headers`; adapt the outer configuration format to your client. The client must support **Streamable HTTP** and custom authorization headers, not the legacy HTTP+SSE transport. The official Python MCP SDK has been checked against this implementation.
+#### Configure Pi once
 
-The server is off each launch. Every Start creates a fresh temporary token; the port may also change. Update the client configuration after restarting. **Stop**, closing the MCP window, closing the main viewer window, or quitting invalidates access. There is no token file, Keychain item, automatic connection, public listener or Tailscale listener for MCP.
+1. Click **Copy Client Config**. Merge its `sharedesk` entry into `~/.pi/agent/mcp.json`, keeping your other server entries. If this project already has a `sharedesk` entry in `.pi/mcp.json`, replace or remove that old entry too: project configuration takes precedence. **Remove the old `Authorization` header**; Pi only uses OAuth when that header is absent.
+2. In Pi, run **`/reload`**, then **`/mcp login sharedesk`**. You can also select the server's **Sign in** action under `/mcp`.
+3. Pi opens a local browser page. Compare its code with the pending code in **Sharedesk → MCP Server…**. Click **Approve Sign-In…** and confirm only if you initiated this sign-in and the codes match. The page continues automatically. **Deny** rejects it; an unfinished sign-in expires after two minutes.
+4. Pi can now read status and screenshots. Enable **Allow MCP Control** separately when you want input. Sign-in alone does not turn control on.
 
-**Privacy:** screenshots can contain sensitive information. A client may store them or send them to an AI provider. Keep the token out of logs, source control and the remote desktop. The copy buttons mark their contents local-only and suppress Sharedesk's automatic and explicit Ubuntu clipboard export for that copy. Other Mac applications may still read or retain the local clipboard.
+The copied entry contains no secret:
+
+```json
+{
+  "mcpServers": {
+    "sharedesk": {
+      "type": "http",
+      "url": "http://127.0.0.1:5917/mcp",
+      "oauth": { "clientId": "sharedesk-pi" }
+    }
+  }
+}
+```
+
+This is **Streamable HTTP**, not legacy HTTP+SSE. The authorization profile is configured for Pi's public client ID and its `http://127.0.0.1:<port>/callback` redirect. The ID is public configuration, **not proof that the requesting program is Pi**. Native approval, PKCE and client-held credentials provide the access checks. There is no dynamic registration or external client-metadata fetch. Pi's installed OAuth implementation and MCP transport have been checked with isolated credentials and a simulated desktop.
+
+#### Restart, revoke and sign in again
+
+The server remains **off each launch**. Start it manually when needed. **Stop**, closing the MCP window, closing the main viewer window, or quitting stops current access and discards access tokens. It does **not** erase remembered approvals: approved clients can refresh their credentials when you next start the server. The URL and Pi configuration stay unchanged. If Pi still shows disconnected, use `/mcp reconnect sharedesk`.
+
+Access tokens last **five minutes**. Pi refreshes them automatically. Each native approval lasts at most **30 days**, including across viewer restarts; refreshing does not extend that deadline. After expiry, sign in and approve again. A VNC-only reconnect also leaves authentication in place, but resets **Allow MCP Control**.
+
+To revoke access now, use **Require Sign-In Again… → Revoke Sign-Ins** while the MCP server is running. This invalidates every remembered approval and access token, cancels pending authorization and unfinished MCP actions, and turns control off. It leaves VNC connected unless a network failure prevents safe input release. In Pi, run `/mcp login sharedesk` and approve the new code. No configuration edit is needed. Pi's **Sign out** removes Pi's local credentials; use Sharedesk's revocation action to invalidate any copies held elsewhere.
+
+Sharedesk keeps a private signing key and up to eight approval records in the non-synchronizing **Sharedesk MCP Authorization** Keychain item (`net.sharedesk.viewer.mcp-authorization`). These are separate from VNC passwords and profiles. Pi keeps its own access/refresh credentials in `~/.pi/agent/mcp-auth.json` (or its configured agent directory), **not in Sharedesk's Keychain**. Keep that file private and out of source control, logs and the remote desktop. Authorization codes are single-use, expire within 60 seconds, and require S256 PKCE and the exact resource and callback URI. Refresh tokens rotate; the immediately previous token has a 30-second retry window for concurrent requests or a lost response. Reusing an older authentic token revokes that approval and turns control off.
+
+Only explicit Start may ask for Keychain permission; HTTP-triggered writes cannot open a Keychain dialog. Keychain failures stop MCP rather than falling back to an unprotected listener or temporary credentials. If revocation cannot be saved, the message warns that previous approvals may still exist: resolve Keychain access, Start again, and repeat **Require Sign-In Again** before relying on durable revocation. A changed ad-hoc-signed build may need renewed Keychain permission. Malformed saved authorization is not silently overwritten; the error identifies the dedicated MCP item to remove in Keychain Access if you want to start authorization again. Do not remove VNC password items.
+
+**Privacy:** screenshots can contain sensitive information. Pi may store them or send them to its AI provider. A remembered approval covers the viewer's current and future VNC connections whenever you start MCP; it is not restricted to one Ubuntu host or profile. The copy button still marks its configuration local-only and suppresses Sharedesk's automatic and explicit Ubuntu clipboard export for that copy. No MCP token is displayed or copied by the viewer. There is no public/Tailscale MCP listener, automatic server start, or MCP connection/clipboard API.
 
 #### Read-only tools
 
@@ -165,7 +196,7 @@ Screenshot text includes a JSON metadata line with `target`, `image_width` and `
 
 #### Allow mouse and keyboard control
 
-Connect to Ubuntu, then explicitly check **Allow MCP Control** in the MCP window. This permits **all clients holding the current token** to send input to this connection. Input can perform destructive actions with the logged-in Ubuntu user's permissions; there is no per-action confirmation dialog.
+Connect to Ubuntu, then explicitly check **Allow MCP Control** in the MCP window. This permits **all currently authorized clients** to send input to this connection. Input can perform destructive actions with the logged-in Ubuntu user's permissions; there is no per-action confirmation dialog.
 
 Control resets to off when the MCP server or VNC connection ends. A local click, drag, scroll, key or modifier action in the remote-desktop area takes over: it revokes MCP control, cancels remaining automated input and releases automated keys/buttons before forwarding local input. Ordinary pointer movement alone does not revoke control; while control is enabled, that movement is not forwarded to Ubuntu. Enable the checkbox again when you want automation to resume. Changing local zoom or collapsing controls does not change permission.
 
@@ -200,9 +231,11 @@ Actions have a five-second deadline. Cancellation allows up to one second for re
 
 #### Transport boundaries
 
-The endpoint validates the bearer token and exact numeric loopback `Host`. An absent `Origin` is accepted; a supplied Origin must match the server's own `http://127.0.0.1:<port>` origin. There is no cross-origin browser access or OAuth flow. A client using a browser proxy must keep that proxy local and supply the header through its trusted backend.
+All routes validate the exact numeric loopback `Host`. An absent `Origin` is accepted; a supplied Origin must be exactly `http://127.0.0.1:5917`. There is no CORS or forwarded-host trust. OAuth discovery, authorization and token routes share the same loopback listener; cross-site browser requests to these routes are rejected. Browser pages have no scripts, external resources or approval form, and use no-store, no-referrer and anti-framing headers. Only the native Sharedesk window can approve access.
 
-This is stateless Streamable HTTP supporting protocol versions `2025-11-25`, `2025-06-18` and `2025-03-26`. POST requests accept JSON and SSE responses. Screenshots use a short SSE response; other results use JSON. GET and DELETE return 405: no background event stream, replay or server-side MCP session is provided. Connections close after one exchange. Request headers are limited to 16 KiB, decoded bodies to 64 KiB, and concurrent HTTP connections to eight; request receipt/completion and response writes are bounded by ten- and fifteen-second deadlines respectively.
+The `/mcp` endpoint requires a valid OAuth access token. Its 401 response advertises protected-resource metadata; the metadata advertises the local authorization server. Tokens are bound to this server's private key, resource URI, pre-registered client and `desktop` scope. Control remains an additional per-VNC-connection local permission, not a scope that a client can enable itself. This local HTTP profile is not intended for reverse proxies, port forwarding, remote browsers or clients on another computer. It assumes a trusted Mac: loopback HTTP does not authenticate the listening process or isolate local users. Another program could occupy the port while Sharedesk is stopped. Do not connect Pi to an unexpected listener, and revoke approvals if you suspect credential theft.
+
+The MCP endpoint remains stateless Streamable HTTP, supporting protocol versions `2025-11-25`, `2025-06-18` and `2025-03-26`. POST requests accept JSON and SSE responses. Screenshots use a short SSE response; other results use JSON. GET and DELETE **on `/mcp`** return 405: no background event stream, replay or server-side MCP session is provided. OAuth discovery and browser navigation use GET on their own routes. Connections close after one exchange. Request headers are limited to 16 KiB, decoded bodies to 64 KiB, and concurrent HTTP connections to eight; request receipt/completion and response writes are bounded by ten- and fifteen-second deadlines respectively. OAuth parameters are limited to 4 KiB, with one pending sign-in and at most twenty token requests per minute.
 
 ### Connection profiles
 

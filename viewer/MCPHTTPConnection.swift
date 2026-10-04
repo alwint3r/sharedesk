@@ -208,6 +208,10 @@ final class MCPHTTPConnection {
                     return
                 }
                 chunked = true
+            } else if header.method == "GET", headers["content-length"] == nil {
+                // Browser navigation and OAuth discovery normally have no
+                // framing header. GET is bodyless; buffered extra bytes still fail.
+                contentLength = 0
             } else {
                 guard let lengthText = headers["content-length"],
                       !lengthText.isEmpty,

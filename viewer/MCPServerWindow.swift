@@ -1,7 +1,7 @@
 import AppKit
 
-// Closing this window stops access. Credentials are never displayed in an
-// editable/selectable field: all secret copies use the viewer's local-only path.
+// Closing this window stops access. Sign-in approval is native-only; the
+// browser cannot grant it. The copied Pi configuration contains no secret.
 @MainActor
 final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     let server: MCPServer
@@ -11,8 +11,12 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     private let endpointField = NSTextField(labelWithString: "Not listening")
     private let copyStatus = NSTextField(wrappingLabelWithString: "")
     private let startButton = NSButton(title: "Start Server", target: nil, action: nil)
-    private let tokenButton = NSButton(title: "Copy Token", target: nil, action: nil)
     private let configButton = NSButton(title: "Copy Client Config", target: nil, action: nil)
+    private let revokeButton = NSButton(title: "Require Sign-In Again…", target: nil, action: nil)
+    private let authorizationStatus = NSTextField(wrappingLabelWithString: "")
+    private let approvalField = NSTextField(wrappingLabelWithString: "No pending sign-in.")
+    private let approveButton = NSButton(title: "Approve Sign-In…", target: nil, action: nil)
+    private let denyButton = NSButton(title: "Deny", target: nil, action: nil)
     private let controlButton = NSButton(checkboxWithTitle: "Allow MCP Control", target: nil, action: nil)
     private let controlStatus = NSTextField(wrappingLabelWithString: "Control off.")
 
@@ -25,7 +29,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         self.copyLocal = copyLocal
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 660),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -56,24 +60,36 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
 
         startButton.target = self
         startButton.action = #selector(toggleServer(_:))
-        tokenButton.target = self
-        tokenButton.action = #selector(copyToken(_:))
         configButton.target = self
         configButton.action = #selector(copyConfig(_:))
-        for button in [startButton, tokenButton, configButton] {
+        revokeButton.target = self
+        revokeButton.action = #selector(requireSignInAgain(_:))
+        approveButton.target = self
+        approveButton.action = #selector(approveSignIn(_:))
+        denyButton.target = self
+        denyButton.action = #selector(denySignIn(_:))
+        for button in [startButton, configButton, revokeButton, approveButton, denyButton] {
             button.bezelStyle = .glass
         }
-        let buttons = NSStackView(views: [startButton, tokenButton, configButton])
+        let buttons = NSStackView(views: [startButton, configButton, revokeButton])
         buttons.orientation = .horizontal
         buttons.alignment = .centerY
         buttons.spacing = 10
 
+        let approvalButtons = NSStackView(views: [approveButton, denyButton])
+        approvalButtons.orientation = .horizontal
+        approvalButtons.spacing = 10
+        authorizationStatus.font = .systemFont(ofSize: 11)
+        authorizationStatus.textColor = .secondaryLabelColor
+        approvalField.font = .systemFont(ofSize: 12, weight: .medium)
+        approvalField.setAccessibilityLabel("Pending MCP sign-in")
+
         let lifecycleNotice = NSTextField(wrappingLabelWithString:
-            "Off each launch. Start creates a new loopback URL and temporary bearer token. " +
-            "Update your client's configuration after each restart. Stop, closing this window, " +
-            "or quitting Sharedesk invalidates access.\n\n" +
-            "Use the copy buttons below rather than copying credentials through the remote desktop. " +
-            "Sharedesk blocks these copies from its Ubuntu clipboard sharing."
+            "Off each launch. Configure Pi once, then use /mcp login sharedesk. Compare the browser's " +
+            "code here before approving. The public client ID is not proof that the requester is Pi.\n\n" +
+            "Approvals are kept in Keychain for up to 30 days. Pi refreshes short-lived tokens automatically. " +
+            "Stop or closing this window ends current access, but approved clients can return on the next Start. " +
+            "Require Sign-In Again revokes remembered access without changing the URL."
         )
         lifecycleNotice.font = .systemFont(ofSize: 11)
         lifecycleNotice.textColor = .secondaryLabelColor
@@ -87,15 +103,16 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
 
         let stack = NSStackView(views: [
             heading, privacyNotice, statusField, endpointField,
-            controlButton, controlStatus, lifecycleNotice, buttons, copyStatus
+            controlButton, controlStatus, lifecycleNotice, buttons, copyStatus,
+            authorizationStatus, approvalField, approvalButtons
         ])
         stack.orientation = .vertical
         stack.distribution = .fill
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for field in [privacyNotice, statusField, controlStatus, lifecycleNotice, copyStatus] {
-            field.widthAnchor.constraint(equalToConstant: 540).isActive = true
+        for field in [privacyNotice, statusField, controlStatus, lifecycleNotice, copyStatus, authorizationStatus, approvalField] {
+            field.widthAnchor.constraint(equalToConstant: 580).isActive = true
         }
 
         let content = panel.contentView!
@@ -119,10 +136,14 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
 
     private func refresh() {
         statusField.stringValue = server.status
-        endpointField.stringValue = server.endpoint ?? "Not listening"
+        endpointField.stringValue = MCPAuthorization.resource + (server.endpoint == nil ? " · stopped" : "")
         startButton.title = server.active ? "Stop Server" : "Start Server"
-        tokenButton.isEnabled = server.endpoint != nil
-        configButton.isEnabled = server.endpoint != nil
+        revokeButton.isEnabled = server.endpoint != nil
+        authorizationStatus.stringValue = server.authorization.status
+        let pendingCode = server.authorization.pendingApprovalCode
+        approvalField.stringValue = pendingCode.map { "Pending sign-in code: \($0) — compare with your browser." } ?? "No pending sign-in."
+        approveButton.isEnabled = pendingCode != nil
+        denyButton.isEnabled = pendingCode != nil
         copyStatus.stringValue = ""
         controlButton.isEnabled = server.controlAvailable
         controlButton.state = server.controlEnabled ? .on : .off
@@ -141,18 +162,47 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         }
     }
 
-    @objc private func copyToken(_ sender: Any?) {
-        guard server.endpoint != nil, let token = server.token else { return }
-        showCopyResult(copyLocal(token))
+    @objc private func approveSignIn(_ sender: Any?) {
+        guard let code = server.authorization.pendingApprovalCode, let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Authorize this sign-in for up to 30 days?"
+        alert.informativeText = "Approve only if you started sign-in in Pi and its browser shows \(code). " +
+            "The client can read screenshots whenever you start this server, including future VNC connections. " +
+            "Screenshots may reach its AI provider. Input also requires Allow MCP Control."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Approve")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertSecondButtonReturn {
+                self?.server.authorization.decideApproval(code: code, allow: true)
+            }
+        }
+    }
+
+    @objc private func denySignIn(_ sender: Any?) {
+        guard let code = server.authorization.pendingApprovalCode else { return }
+        server.authorization.decideApproval(code: code, allow: false)
+    }
+
+    @objc private func requireSignInAgain(_ sender: Any?) {
+        guard server.endpoint != nil, let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Revoke every remembered MCP sign-in?"
+        alert.informativeText = "This turns control off, cancels unfinished MCP actions and invalidates all client credentials. " +
+            "The VNC connection stays open. In Pi, use /mcp login sharedesk to authorize again. Its configuration does not change."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Revoke Sign-Ins")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertSecondButtonReturn {
+                self?.server.authorization.requireSignInAgain()
+            }
+        }
     }
 
     @objc private func copyConfig(_ sender: Any?) {
-        guard let endpoint = server.endpoint, let token = server.token else { return }
-
         let serverConfiguration: [String: Any] = [
             "type": "http",
-            "url": endpoint,
-            "headers": ["Authorization": "Bearer \(token)"]
+            "url": MCPAuthorization.resource,
+            "oauth": ["clientId": MCPAuthorization.clientID]
         ]
         let configuration = ["mcpServers": ["sharedesk": serverConfiguration]]
         guard let data = try? JSONSerialization.data(
@@ -168,7 +218,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     private func showCopyResult(_ success: Bool) {
         if success {
             copyStatus.stringValue =
-                "Copied locally. Paste only into a trusted MCP client; other Mac apps may read the clipboard."
+                "Copied client configuration; no secret included. Replace the old sharedesk entry in your MCP client."
         } else {
             copyStatus.stringValue = "Could not write to the Mac clipboard."
         }
