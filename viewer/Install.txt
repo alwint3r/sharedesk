@@ -20,10 +20,26 @@ Connect
   VNC port and password, then click Connect. The host accepts one viewer at a
   time, so disconnect Screen Sharing or another viewer first.
 
+Optional MCP access
+  MCP is off each launch and listens only on this Mac at
+  http://127.0.0.1:5917/mcp. Open Sharedesk > MCP Server, then Start Server.
+  Copy Client Config and use your MCP client's OAuth sign-in action. Approve
+  only a sign-in you initiated, after matching the browser and viewer codes.
+  Client compatibility is limited to the implemented OAuth profile; the
+  repository README documents the verified client setup.
+
+  Authorized clients can read screenshots and may send them to an AI provider.
+  Allow MCP Control is a separate permission for mouse and keyboard input,
+  including potentially destructive actions on Ubuntu. It starts off.
+  Stop or closing the MCP window ends access now, but remembered approvals
+  can return on the next Start for up to 30 days. Require Sign-In Again
+  revokes remembered access. Installing an update does not revoke it.
+
 Existing data
   Installation does not include, replace or remove your saved profiles.
-  They stay in ~/.sharedesk/profiles.json. Optional saved passwords stay in
-  macOS Keychain. macOS may ask for renewed Keychain access for this build.
+  They stay in ~/.sharedesk/profiles.json. Optional saved VNC passwords and
+  remembered MCP authorizations stay in separate macOS Keychain items.
+  macOS may ask for renewed Keychain access for this build.
   The app never connects automatically or saves a password in the profile file.
 
 Update / remove

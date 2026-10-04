@@ -10,7 +10,7 @@ struct MCPDesktopSnapshot {
     let image: CGImage? // Immutable owning image; never a borrowed VNC buffer.
 }
 
-// Experimental, stateless Streamable HTTP. The viewer owns Start/Stop and the
+// Stateless Streamable HTTP. The viewer owns Start/Stop and the
 // snapshot and input providers. No blocking VNC calls, pasteboard access,
 // files or logging here. Input is denied unless explicitly enabled locally.
 @MainActor
@@ -453,7 +453,7 @@ final class MCPServer {
             sendRPCResult(client, id: requestID, result: [
                 "protocolVersion": negotiatedVersion,
                 "capabilities": ["tools": [:] as [String: Any]],
-                "serverInfo": ["name": "sharedesk-viewer", "version": "0.1-experimental"],
+                "serverInfo": ["name": "sharedesk-viewer", "version": "0.1"],
                 "instructions": "Access to the viewer's current remote desktop. Screenshots may contain sensitive information. " +
                     "Input requires the viewer's Allow MCP Control switch. Use target from current status or screenshot metadata. " +
                     "Pointer coordinates are full remote pixels; scale resized PNG coordinates using its metadata. " +

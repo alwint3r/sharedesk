@@ -34,7 +34,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        panel.title = "MCP Server · Experimental"
+        panel.title = "MCP Server"
         panel.isFloatingPanel = false
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false

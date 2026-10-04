@@ -4,6 +4,8 @@ A small private remote-desktop application: an **Ubuntu X11 host** and a **nativ
 
 This is an early VNC application, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
 
+The **0.1 private viewer** on `main` includes profiles, Unicode text clipboard sharing, zoom, manual connection recovery, statistics, and opt-in MCP access. MCP no longer requires a separate experiment branch. This remains a private build, not a public release or a claim of compatibility with every MCP client.
+
 ## Repository layout
 
 ```text
@@ -22,9 +24,13 @@ viewer/
   DesktopView.swift           # Rendering, cursor and input
   VNCSession.swift            # Worker, session state, queues and deadlines
   VNCInputAction.swift        # Bounded input plans, release state and completion handles
-  MCPServer.swift             # Experimental loopback MCP lifecycle and tool dispatch
+  MCPServer.swift             # Loopback MCP lifecycle and tool dispatch
   MCPHTTPConnection.swift     # Bounded HTTP/1.1 requests and responses
-  MCPServerWindow.swift       # Start/Stop, local credential copies and control permission
+  MCPServerWindow.swift       # Start/Stop, sign-in approval, client config and control permission
+  MCPAuthorization.swift      # OAuth approval, short-lived tokens and refresh rotation
+  MCPAuthorizationStore.swift # Dedicated Keychain signing key and remembered approvals
+  MCPKeychain.c               # Noninteractive legacy Keychain writes and UI-setting restoration
+  MCPKeychain.h
   MCPControl.swift            # Input tool schemas, validation and concrete action plans
   ConnectionStatistics.swift  # On-demand, content-free session statistics panel
   ConnectionProfiles.swift    # Validated profile settings and private file storage
@@ -32,7 +38,7 @@ viewer/
   ProfilePasswords.swift      # Optional macOS Keychain credentials
   VNCBridge.c                 # LibVNCClient interop, bounded clipboard codec and buffers
   VNCBridge.h
-  module.modulemap            # Swift import of the C bridge
+  module.modulemap            # Swift imports of the C bridges
   viewer-Info.plist.in
   sharedesk-viewer.icns        # Packaged macOS app icon
   make-icon.swift             # Editable icon artwork and size generation
@@ -66,7 +72,7 @@ The private installer is **`build-mac/Sharedesk-0.1-arm64.dmg`**. It contains a 
 open build-mac/Sharedesk-0.1-arm64.dmg
 ```
 
-Quit an existing viewer when convenient, drag **Sharedesk.app** onto the **Applications** shortcut, eject the disk image, then open Sharedesk from Applications. Installation does not change the Ubuntu host, `~/.sharedesk/profiles.json`, or saved Keychain passwords. macOS may request renewed Keychain access for the installed build.
+Quit an existing viewer when convenient, drag **Sharedesk.app** onto the **Applications** shortcut, eject the disk image, then open Sharedesk from Applications. Installation does not change the Ubuntu host, `~/.sharedesk/profiles.json`, saved VNC passwords, or remembered MCP authorizations in Keychain. macOS may request renewed Keychain access for the installed build.
 
 **This is an ad-hoc signed private build, not an Apple-notarized public release.** If macOS blocks a copy you know and trust, try opening it, then use **System Settings → Privacy & Security → Open Anyway** and confirm. Do not disable Gatekeeper globally. Intel and older macOS versions are not supported by this package; the bundled Homebrew libraries require macOS 27.
 
@@ -84,6 +90,14 @@ This builds the viewer, stages it as `Sharedesk.app`, embeds LibVNCClient and it
 
 The ordinary `build-mac/sharedesk-viewer.app` remains a development bundle. Packaging changes only a staged copy; macOS supplies the system frameworks and Swift runtime. Third-party notices are in the installed app's `Contents/Resources/ThirdPartyNotices.txt` and `Contents/Resources/Licenses`. LibVNCClient uses GPL-2.0-or-later; review licensing and corresponding-source requirements before redistributing this private package.
 
+### Private release checkpoints
+
+Preserved local checkpoints live in `out/private-0.1-<UTC timestamp>/`, outside the normal build output and Git tracking. A checkpoint contains the DMG, an archive of the exact tracked working-tree source, a SHA-256 checksum list, and a manifest recording the base Git revision, any uncommitted source changes, build tools, dependencies, verification results, and remaining acceptance work. Untracked files such as `.pi/`, personal settings, and credentials are not included.
+
+The `package` target does not create or update these snapshots. Verify a preserved checkpoint from its directory with `shasum -a 256 -c SHA256SUMS`. Keep a copy outside the repository before deleting build artifacts or the checkout. A checkpoint is an artifact/source snapshot, not a Git tag, a public release, or a guarantee of a byte-identical rebuild on a different Mac.
+
+Build, packaging, and isolated checks do not replace normal use of the installed app. Acceptance of the installed Keychain/OAuth flow and real-device performance measurements remain separate. Existing statistics do not measure end-to-end input latency.
+
 ## Build the Mac viewer
 
 On the Mac, install LibVNCClient through Homebrew's `libvncserver` package. Xcode or its Command Line Tools must provide a Swift 6 or newer compiler and the macOS SDK. Use Ninja for the Swift build:
@@ -97,7 +111,7 @@ open build-mac/sharedesk-viewer.app
 
 **Upgrading an existing build:** CMake cannot change an existing build directory from Unix Makefiles to Ninja. Before configuring, move the old `build-mac` directory to an unused backup path, such as `build-mac-objectivec`, then run the commands above. Keep the working app and its source revision until normal use with the Swift viewer confirms the migration. Quit the Swift viewer before opening the fallback app at `build-mac-objectivec/sharedesk-viewer.app`.
 
-CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with a small plain-C bridge to LibVNCClient. There is no application-owned Objective-C in the active viewer.
+CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift and AppKit, with small plain-C bridges for LibVNCClient and noninteractive Keychain writes. There is no application-owned Objective-C in the active viewer.
 
 Connection controls use native AppKit Liquid Glass in light and dark appearance, with a separate rounded remote-desktop canvas and a connection-state footer. Glass stays off the remote image.
 
@@ -146,9 +160,9 @@ Rates start with **Sampling…** on opening or reconnecting, then use the actual
 
 These are content-free, in-memory counters. There are no statistics logs, exports, background probes or latency estimates. Opening Stats never reads the clipboard or Keychain and does not change profiles. The Ubuntu host's separate `--stats` option is not required.
 
-### Experimental MCP access and control
+### MCP access and control
 
-On `experiment/mcp-http-sse`, the viewer can serve its **current VNC connection** to Pi on the same Mac. It does not open another VNC connection or change the Ubuntu host. Use **Sharedesk → MCP Server… → Start Server**. The server starts with control off and listens only at **`http://127.0.0.1:5917/mcp`**. If port 5917 is occupied, Start fails with a message; it never selects another port or stops the other process.
+The viewer on `main` can expose its **current VNC connection** to a trusted MCP client on the same Mac. Pi is currently the verified client; its setup is documented below. It does not open another VNC connection or change the Ubuntu host. Use **Sharedesk → MCP Server… → Start Server**. The server starts with control off and listens only at **`http://127.0.0.1:5917/mcp`**. If port 5917 is occupied, Start fails with a message; it never selects another port or stops the other process.
 
 #### Configure Pi once
 
