@@ -1,8 +1,8 @@
 # Sharedesk
 
-A small private remote-desktop application: an **Ubuntu X11 host** and a **native Mac viewer**. The host captures an already-started desktop and accepts keyboard/mouse input. The viewer uses standard VNC, including opt-in two-way text clipboard sharing. Screen Sharing remains an alternative for desktop access, but its clipboard interoperability has not been established. No relay server or public inbound port is needed.
+A small private remote-desktop application: an **Ubuntu X11 host** and a **native Mac viewer**. The host captures an X11 display and accepts keyboard/mouse input. The viewer uses standard VNC, including opt-in two-way text clipboard sharing. Screen Sharing remains an alternative for desktop access, but its clipboard interoperability has not been established. No relay server or public inbound port is needed.
 
-This is an early VNC application, not an AnyDesk-compatible client. The Ubuntu user must already be logged into an X11 desktop. Do not run it as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
+This is an early VNC application, not an AnyDesk-compatible client. Normal manual/per-user startup requires an already logged-in X11 desktop. An [opt-in Ubuntu 22.04 GDM/Xorg service](#enable-access-before-ubuntu-login) can also share the login screen after boot. Do not run the network-facing host as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
 
 The **0.1 private viewer** on `main` includes profiles, Unicode text clipboard sharing, zoom, manual connection recovery, statistics, and opt-in MCP access. MCP no longer requires a separate experiment branch. This remains a private build, not a public release or a claim of compatibility with every MCP client.
 
@@ -14,9 +14,12 @@ README.md                     # Shared build and usage documentation
 host/
   CMakeLists.txt               # Host target and dependencies
   host.c
+  login-service.c             # Optional privileged session selector; no VNC listener
+  sharedesk-host.service.in    # System service template, installed only on explicit request
   libvncserver-clipboard.patch # Unified safety patch for the private dependency
   patch-vnc-clipboard.cmake    # Apply/check the pinned dependency patch
   scripts/install-autostart.py
+  scripts/install-login-service.py
 viewer/
   CMakeLists.txt               # Viewer target and dependencies
   main.swift                  # Application entry point
@@ -58,7 +61,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-The first configuration downloads a SHA-256-pinned **LibVNCServer 0.9.15** source archive. Ubuntu 22.04's system 0.9.13 has no Unicode clipboard extension. CMake applies `host/libvncserver-clipboard.patch` to validate compressed text lengths, then links the private server library statically into `build/sharedesk-host`. Ubuntu's system VNC library is not replaced, and the autostart installer still copies a single host executable. Compression/image libraries and X11 remain system dependencies. Examples, tests, background-thread support, TLS, WebSockets and file-transfer extensions are disabled in this private library; Tailscale remains the transport security boundary.
+The first configuration downloads a SHA-256-pinned **LibVNCServer 0.9.15** source archive. Ubuntu 22.04's system 0.9.13 has no Unicode clipboard extension. CMake applies `host/libvncserver-clipboard.patch` to validate compressed text lengths, then links the private server library statically into `build/sharedesk-host`. Ubuntu's system VNC library is not replaced, and the per-user autostart installer still copies a single host executable. Compression/image libraries and X11 remain system dependencies. Examples, tests, background-thread support, TLS, WebSockets and file-transfer extensions are disabled in this private library; Tailscale remains the transport security boundary.
 
 For an offline build, provide a writable extracted copy of the pinned 0.9.15 source with `-DFETCHCONTENT_SOURCE_DIR_SHAREDESK_VNC=/path/to/source` on the configure command. The same unified patch is checked and applied there. The private library is GPL-2.0-or-later; review its license and corresponding-source obligations before distributing host binaries.
 
@@ -210,7 +213,7 @@ Screenshot text includes a JSON metadata line with `target`, `image_width` and `
 
 #### Allow mouse and keyboard control
 
-Connect to Ubuntu, then explicitly check **Allow MCP Control** in the MCP window. This permits **all currently authorized clients** to send input to this connection. Input can perform destructive actions with the logged-in Ubuntu user's permissions; there is no per-action confirmation dialog.
+Connect to Ubuntu, then explicitly check **Allow MCP Control** in the MCP window. This permits **all currently authorized clients** to send input to this connection. Input can perform destructive actions with the logged-in Ubuntu user's permissions; there is no per-action confirmation dialog. With pre-login hosting, it can also operate GDM. Keep **Allow MCP Control** off while entering Ubuntu account credentials yourself.
 
 Control resets to off when the MCP server or VNC connection ends. A local click, drag, scroll, key or modifier action in the remote-desktop area takes over: it revokes MCP control, cancels remaining automated input and releases automated keys/buttons before forwarding local input. Ordinary pointer movement alone does not revoke control; while control is enabled, that movement is not forwarded to Ubuntu. Enable the checkbox again when you want automation to resume. Changing local zoom or collapsing controls does not change permission.
 
@@ -315,7 +318,7 @@ Optional flags: `--port` (1–65535, default 5900) and `--fps` (1–30, default 
 
 ## Start automatically with the Ubuntu X11 desktop
 
-After the manual connection works, install per-user graphical-session autostart **on Ubuntu** (not on the Mac). Use the same password file and port that worked manually:
+Choose this mode if access **after local login** is sufficient. Do not combine it with the [pre-login service](#enable-access-before-ubuntu-login). After the manual connection works, install per-user graphical-session autostart **on Ubuntu** (not on the Mac). Use the same password file and port that worked manually:
 
 ```sh
 python3 host/scripts/install-autostart.py --password-file "$HOME/.sharedesk/vnc-password" --port 5901
@@ -333,6 +336,111 @@ python3 host/scripts/install-autostart.py --remove
 
 This does not stop a host that is already running, and it leaves the password file and logs intact. Use `pgrep -a sharedesk-host` to find a running host and `kill <PID>` to stop it if needed.
 
+## Enable access before Ubuntu login
+
+This optional mode targets **Ubuntu 22.04, GDM3, Xorg, and the physical `seat0` desktop**. It shares the GDM login screen after Ubuntu boots, then the configured user's X11 desktop. You still enter that user's **Ubuntu account password** at GDM; the VNC password only permits connecting to Sharedesk. Automatic/timed OS login is not enabled, and the installer refuses a GDM configuration that already enables it.
+
+**It cannot unlock an encrypted disk before Ubuntu starts, wake a suspended laptop, or bypass a login password.** Tailscale must already be configured to start and connect without user login. Keep the laptop awake and restrict its VNC port with your Tailscale access policy. The installer does not change disk encryption, lid/suspend settings, firewall rules or Tailscale configuration.
+
+### Install for the next boot
+
+Run these commands **on Ubuntu**, from the repository root, as the intended desktop user. The normal host build dependencies listed above are also required:
+
+```sh
+sudo apt install libsystemd-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHAREDESK_LOGIN_SERVICE=ON
+cmake --build build
+chmod go-w build/sharedesk-host build/sharedesk-login-service
+
+# Remove only the old per-user startup files; its running host is not stopped.
+python3 host/scripts/install-autostart.py --remove
+
+sudo python3 host/scripts/install-login-service.py \
+  --user "$(id -un)" \
+  --password-file "$HOME/.sharedesk/vnc-password" \
+  --port 5901 --fps 30 --stats \
+  --configure-gdm-xorg
+```
+
+The installer rejects group-/other-writable source binaries. Ubuntu's common `0002` umask can produce mode-775 executables; the `chmod go-w` command above removes those write permissions without weakening the installer's check. Repeat it after rebuilding when updating this service.
+
+`--configure-gdm-xorg` explicitly permits setting **`WaylandEnable=false`** in `/etc/gdm3/custom.conf`. This affects GDM's available login/desktop backend, not just Sharedesk. The installer keeps a private original and a fingerprint of its edited version under `/etc/sharedesk/`; it does not replace other GDM settings. If GDM is already explicitly configured for Xorg, this flag and a configuration edit are unnecessary.
+
+Add **`--clipboard`** if wanted for the configured user's desktop. The login-screen worker always has clipboard sharing disabled, even with that flag and the viewer checkbox enabled. A locked, already logged-in desktop remains a user session, with its configured clipboard setting.
+
+The installer copies both Linux executables to `/usr/local/libexec/sharedesk/`, copies the VNC password to root-owned **`/etc/sharedesk/vnc-password`** with mode 600, and enables **`sharedesk-host.service`** for boot. The original user password file is retained. Changing that original file later does not update the service's copy; rerun the installer to replace it. The default build does not require libsystemd or build/install this supervisor unless `SHAREDESK_LOGIN_SERVICE=ON` is selected.
+
+**Installation does not start the new service, stop the current host, or restart GDM.** Both installers reject conflicting standard per-user/system installations. If you used a custom `XDG_CONFIG_HOME` or another launcher, remove that startup entry yourself too; the system installer checks the normal `~/.config/autostart` location only. Do not keep a second host competing for the same port.
+
+After reviewing the installation, reboot **when convenient**. For the first real-device check, keep a local recovery path available. Connect to the same Tailscale address and port. Sign in at GDM, wait for the desktop to start, then use the viewer's **Reconnect** button. The existing viewer needs no update. Login, logout and user switching can end VNC; reconnect remains manual and may need the VNC password again if it was not saved in the selected profile.
+
+### Session selection and safety
+
+- A small root supervisor observes logind's active session. It shares only GDM's X11 greeter or the configured user's active local X11 session. It stops sharing while another user, a Wayland session, or no supported session is active.
+- Capture, keyboard/mouse handling, clipboard handling and the VNC listener run in the existing host **as the selected session's user**, never as root. The supervisor reads no screen pixels or Xauthority cookie contents. It passes only a read-only password descriptor to the worker, drops its user/group privileges, clears the environment and unrelated descriptors, and prevents privilege acquisition.
+- Display discovery uses local Unix socket peer credentials and logind session membership, not a guessed `:0`, another process's environment, or Xorg lock files. It follows Ubuntu libxcb's abstract-socket preference and checks the connected X server PID again in the worker. It supports standard local display numbers 0–63 and GDM's `/run/user/<UID>/gdm/Xauthority` layout. GDM's standard separate greeter/user X servers are required. Custom GDM builds that reuse one server across users, other display managers, seats and Xauthority layouts are not supported.
+- It binds only a Tailscale IPv4 address on `tailscale0`. If that address or the active session changes, the old worker must stop before a replacement starts. A stuck worker is terminated after a bounded grace period. An unexpected worker exit is retried after five seconds; this does **not** add automatic reconnect to the Mac viewer.
+- The root supervisor is not a general-purpose user-switching command. Install it only from source/binaries you trust, with normal administrator privileges. Do not grant an untrusted account a restricted sudo rule for this installer.
+
+### Diagnose, update or remove
+
+Read service state and logs without changing the running session:
+
+```sh
+sudo systemctl status sharedesk-host.service
+sudo journalctl -u sharedesk-host.service -b
+```
+
+A waiting message identifies a missing supported session, GDM authority file, verified Xorg listener, or Tailscale address. For an X11 failure, confirm GDM and the user's desktop are Xorg. For a bind failure, check for an old per-user/manual host on the same port. Do not solve either problem by running the VNC host as root or opening a public listener.
+
+Updating/removing an active system service is deliberately refused. When an interruption is acceptable, stop it yourself with `sudo systemctl stop sharedesk-host.service`, rebuild and rerun the installer with the desired options. Then explicitly start it with `sudo systemctl start sharedesk-host.service`, or wait for the next boot. Changing only `--clipboard`, `--stats`, port or frame rate uses the same update procedure. Rebuilding alone does not update installed executables.
+
+To remove it after explicitly stopping it:
+
+```sh
+sudo python3 host/scripts/install-login-service.py --remove
+```
+
+This disables and removes the inactive service and its executables. It retains the private password, GDM setting and backup, and does not restore per-user autostart. Add **`--restore-gdm`** to the removal command to restore the saved original GDM configuration. Restoration is refused if the current file differs from the installer's fingerprint; review the backup manually rather than overwrite later administrator changes. Restoring the file does not restart GDM; its backend setting takes effect at a later restart/reboot.
+
+**Verification:** isolated Ubuntu 22.04 x86-64 and ARM64 checks cover installation/rollback, GDM-style `-displayfd` discovery, VNC authentication and pixels, privilege dropping, greeter/desktop handoff, clipboard gating and failure handling. Those checks use synthetic logind state and X11 servers.
+
+A separate **Ubuntu 22.04.5 ARM64 VM under QEMU 11.1.2/HVF**, with real systemd/logind and GDM 42, also passed repeated cold boots to the Xorg greeter, password login over VNC, explicit desktop reconnect, keyboard input, lock/unlock, logout and user switching. Checks confirmed the real systemd restrictions, unprivileged workers, disabled greeter clipboard, exact desktop clipboard transfer, no VNC listener for another user or a Wayland greeter, interface-loss recovery, refusal to update an active service, and bounded termination of a paused worker. Removal restored the original GDM configuration without restarting GDM; the next boot returned to its original Wayland greeter with no Sharedesk service. A separate Mac LibVNCClient probe received the VM framebuffer through a loopback-only SSH tunnel; the running Sharedesk viewer was not interrupted.
+
+**Still unverified:** actual Tailscale startup, access policy and transport in this boot flow, and physical-laptop GPU, monitor-blanking and suspend behavior. The VM used a dummy `tailscale0` address, not a real Tailscale node. QEMU results do not resolve the intermittent physical-desktop frozen-image report or measure end-to-end latency. First-boot acceptance on the actual laptop remains necessary.
+
+### Reproduce the QEMU verification
+
+From the repository root on an **Apple Silicon Mac**, run:
+
+```sh
+python3 host/scripts/verify-login-qemu.py run
+```
+
+Prerequisites are Python 3, QEMU with HVF and its packaged EDK2 firmware, GnuPG (`gpg` and `gpgconf`), `pkg-config`, the LibVNCClient/OpenSSL development libraries used by the viewer, and the Xcode command-line tools. The script checks for tools; it does **not** install Mac packages. Allow 6 GiB of RAM, four virtual CPUs and at least 10 GiB of free disk space. The VM disk has a 35 GiB sparse capacity.
+
+The script downloads the current Ubuntu Jammy ARM64 cloud image, verifies its checksum manifest against the pinned Ubuntu cloud-image signing key, then verifies the image hash. It provisions the desktop and build dependencies inside the VM and builds the current host with `-Werror`. Internet access is available during provisioning only. Verification boots use restricted QEMU networking, a guest-only dummy `tailscale0`, loopback-only SSH forwarding and Unix-socket console/QMP endpoints. No host directory is mounted, no real Tailscale node is enrolled, and neither the running viewer nor the Ubuntu laptop is controlled.
+
+The companion `host/scripts/qemu-guest-check.py` exercises the real GDM/systemd lifecycle described above. `host/scripts/qemu-mac-peer.c` checks framebuffer reception and other-user rejection with a separate Mac LibVNCClient process. The GUI fixture expects standard Jammy GDM at **1280×800**, with its two disposable test accounts; layout changes can require updating the test coordinates. GUI input is deliberately paced: this is not a rapid-input or latency test. These checks do not exercise the Mac viewer's Reconnect button itself.
+
+The command prints a private workspace such as `/private/tmp/sharedesk-qemu.ABC123`. It stops the VM on completion or test failure but **retains** its image, pre-installation snapshot, fixture credentials and results. In `reports/<timestamp>/`, inspect `summary.json`, the per-stage logs, source hashes and `guest-results.tar.gz` (check results, package versions, journals and synthetic-desktop PNGs). The image URL/hash and QEMU version are also recorded. The upstream image and Ubuntu packages can change; this is a reproducible workflow, not a promise of byte-identical fresh installations.
+
+Use the exact workspace path printed by your run:
+
+```sh
+# Restore the disposable baseline, copy current host sources and rebuild offline.
+# This discards changes inside that VM, not on the Mac or laptop.
+python3 host/scripts/verify-login-qemu.py verify --work /private/tmp/sharedesk-qemu.ABC123
+
+# Stop only that VM, retaining its data and results.
+python3 host/scripts/verify-login-qemu.py stop --work /private/tmp/sharedesk-qemu.ABC123
+
+# Stop and delete that VM, its credentials, snapshots and results.
+python3 host/scripts/verify-login-qemu.py clean --work /private/tmp/sharedesk-qemu.ABC123
+```
+
+Concurrent commands against the same workspace are refused. Interrupt its active controller before using `stop` or `clean`. A changed dependency may require a fresh `run`, because `verify` cannot download packages or source dependencies. A failed provisioning run also needs a fresh workspace; it has no usable baseline yet. Never reuse the public fixture passwords for real accounts, and never run the guest helper on the actual laptop. Keep these scripts in the repository, but keep VM images and generated results outside it.
+
 ## Text clipboard sharing
 
 Clipboard sharing is **off by default**. Add `--clipboard` to enable two-way text sharing with the authenticated viewer:
@@ -343,7 +451,7 @@ Clipboard sharing is **off by default**. Add `--clipboard` to enable two-way tex
   --port 5901 --fps 30 --stats --clipboard
 ```
 
-To enable it in the installed autostart copy:
+To enable it in the installed **per-user** autostart copy (for the system service, use the update procedure above):
 
 ```sh
 python3 host/scripts/install-autostart.py \
@@ -374,7 +482,7 @@ Statistics are off by default. Add `--stats` to print one summary to stderr ever
   --password-file "$HOME/.sharedesk/vnc-password" --port 5901 --stats
 ```
 
-For autostart, enable the same option when updating its installed copy:
+For per-user autostart, enable the same option when updating its installed copy:
 
 ```sh
 python3 host/scripts/install-autostart.py \
@@ -382,6 +490,8 @@ python3 host/scripts/install-autostart.py \
 ```
 
 Restart the host to load the updated launcher. Autostart summaries go to `~/.local/state/sharedesk/host.log` (or `$XDG_STATE_HOME/sharedesk/host.log` if set). To disable them, run the installer without `--stats` and restart the host. Enabling statistics needs no additional dependencies beyond those listed in the build instructions.
+
+With the pre-login service, pass `--stats` to its installer and read these summaries through `journalctl -u sharedesk-host.service -b`. Greeter and desktop workers have separate counter lifetimes. CPU figures cover the VNC worker, not the session supervisor.
 
 An example summary with illustrative values:
 
@@ -413,5 +523,5 @@ Traffic is an estimate from the library's counters, not an exact socket or netwo
 - Reads full-screen images when needed and sends changed 64×64 regions. XDamage reduces unchanged-screen work, but safety refreshes and the polling fallback still read pixels. This is not video-based streaming; CPU use and motion depend on drawing, capture, encoding and the network.
 - X11 keys, pointer buttons and scrolling. Keyboard symbols must be available in the active Ubuntu layout group; unsupported symbols are ignored rather than added to the local keymap. Layout-group switching and locked/latched layout modifiers are not synthesized. Some Mac-specific keys may not map. Local and remote input share the X11 keyboard; they are not isolated devices.
 - Standard VNC cursor-shape updates have one-bit transparency, so soft edges are approximate. Screen-drawn cursors preserve alpha blending. Cursor images above 1024×1024 pixels are ignored; cursors too large for LibVNCServer's cursor-update buffer are drawn in the screen stream for shape-capable viewers.
-- One viewer at a time. Optional text clipboard sharing only; no audio, file transfer, or login-screen access.
-- Existing X11 session only; after reboot, a user must start a desktop session locally.
+- One viewer at a time. Optional text clipboard sharing only; no audio or file transfer.
+- Normal manual/per-user startup requires an existing X11 desktop. Pre-login access requires the opt-in Ubuntu 22.04 GDM/Xorg service; there is no Wayland capture, pre-boot disk unlock, automatic OS login or automatic viewer reconnect.

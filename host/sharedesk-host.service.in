@@ -1,0 +1,38 @@
+# Managed by Sharedesk's opt-in login-service installer.
+[Unit]
+Description=Sharedesk GDM/Xorg login-screen and desktop supervisor
+After=display-manager.service systemd-logind.service tailscaled.service
+Wants=display-manager.service systemd-logind.service tailscaled.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/libexec/sharedesk/sharedesk-login-service @ARGUMENTS@
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=64 77 78
+KillMode=mixed
+TimeoutStopSec=5
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+# Xorg and the host must share the X11 socket directory and SysV SHM namespace.
+PrivateTmp=false
+PrivateIPC=false
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target

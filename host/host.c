@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
@@ -24,6 +25,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -875,16 +877,21 @@ static void pointer_event(int mask, int x, int y, rfbClientPtr client) {
     XFlush(host->display);
 }
 
-static int read_password(const char *path, char password[9]) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+/* An inherited descriptor transfers read/close ownership to the host. The
+ * login supervisor opens the root-owned secret before dropping privileges;
+ * ordinary pathname-based startup still requires this user's own file. */
+static int read_password(const char *path, int inherited_fd, char password[9]) {
+    int fd = path ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : inherited_fd;
+    const char *source = path ? path : "inherited descriptor";
     if (fd < 0) {
         perror("Opening password file");
         return -1;
     }
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
-        (st.st_mode & 077) != 0) {
-        fprintf(stderr, "Password file must be a regular file owned by this user, with no group/other access: %s\n", path);
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        (st.st_uid != geteuid() && (path || st.st_uid != 0)) || (st.st_mode & 077) != 0) {
+        fprintf(stderr, "Password must be a private regular file owned by this user (or root for an inherited descriptor): %s\n", source);
         close(fd);
         return -1;
     }
@@ -899,7 +906,7 @@ static int read_password(const char *path, char password[9]) {
     int error = ferror(file);
     fclose(file);
     if (error) {
-        fprintf(stderr, "Cannot read password file: %s\n", path);
+        fprintf(stderr, "Cannot read password file: %s\n", source);
         return -1;
     }
     if (length && content[length - 1] == '\n') --length;
@@ -1464,23 +1471,39 @@ compose_frame:
 int main(int argc, char **argv) {
     const char *listen_ip = NULL;
     const char *password_file = NULL;
+    int password_fd = -1, x11_server_pid = -1;
     int port = 5900, fps = 10, stats_enabled = 0, clipboard_enabled = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen_ip = argv[++i];
         else if (!strcmp(argv[i], "--password-file") && i + 1 < argc) password_file = argv[++i];
+        else if (!strcmp(argv[i], "--password-fd") && i + 1 < argc) {
+            password_fd = parse_number(argv[++i], 0, INT_MAX);
+            if (password_fd < 0) {
+                fprintf(stderr, "The inherited password descriptor must be a nonnegative integer\n");
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--x11-server-pid") && i + 1 < argc) {
+            x11_server_pid = parse_number(argv[++i], 2, INT_MAX);
+            if (x11_server_pid < 0) {
+                fprintf(stderr, "The expected X11 server PID must be a positive process ID\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = parse_number(argv[++i], 1, 65535);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = parse_number(argv[++i], 1, 30);
         else if (!strcmp(argv[i], "--stats")) stats_enabled = 1;
         else if (!strcmp(argv[i], "--clipboard")) clipboard_enabled = 1;
         else {
-            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> --password-file <file> [--port 5900] [--fps 10] [--stats] [--clipboard]\n", argv[0]);
+            fprintf(stderr, "Usage: %s --listen <Tailscale IPv4> (--password-file <file> | --password-fd <fd>)\n"
+                    "  [--port 5900] [--fps 10] [--stats] [--clipboard] [--x11-server-pid <PID>]\n", argv[0]);
             return 2;
         }
     }
     struct in_addr address;
-    if (!listen_ip || !password_file || port < 1 || fps < 1 ||
+    if (!listen_ip || ((password_file != NULL) == (password_fd >= 0)) || port < 1 || fps < 1 ||
         inet_pton(AF_INET, listen_ip ? listen_ip : "", &address) != 1) {
-        fprintf(stderr, "Provide a Tailscale IPv4 or loopback address, a password file, and valid port/fps\n");
+        fprintf(stderr, "Provide a Tailscale IPv4 or loopback address, exactly one password file/descriptor, and valid port/fps\n");
         return 2;
     }
     uint32_t ip = ntohl(address.s_addr);
@@ -1490,14 +1513,24 @@ int main(int argc, char **argv) {
         return 2;
     }
     char password[9];
-    if (read_password(password_file, password) != 0) return 1;
+    if (read_password(password_file, password_fd, password) != 0) return 1;
     char *passwords[] = {password, NULL};
 
     Host host = {0};
     host.display = XOpenDisplay(NULL);
     if (!host.display) {
-        fprintf(stderr, "Cannot open X11 display; run inside the logged-in Ubuntu X11 session (DISPLAY/XAUTHORITY)\n");
+        fprintf(stderr, "Cannot open X11 display; check DISPLAY/XAUTHORITY and Xorg session availability\n");
         return 1;
+    }
+    if (x11_server_pid >= 0) {
+        struct ucred peer;
+        socklen_t length = sizeof peer;
+        if (getsockopt(ConnectionNumber(host.display), SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
+            length != sizeof peer || peer.pid != x11_server_pid || (peer.uid != geteuid() && peer.uid != 0)) {
+            fprintf(stderr, "The X11 server changed during session handoff; no desktop shared\n");
+            XCloseDisplay(host.display);
+            return 1;
+        }
     }
     int event_base, error_base, major, minor;
     if (!XTestQueryExtension(host.display, &event_base, &error_base, &major, &minor)) {

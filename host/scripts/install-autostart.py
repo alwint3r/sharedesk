@@ -48,6 +48,8 @@ def main() -> int:
         print("Removed Sharedesk autostart files. A host already running will continue until stopped.")
         return 0
 
+    if Path("/etc/systemd/system/sharedesk-host.service").exists():
+        parser.error("the system login service is installed; do not also install per-user autostart. Update that service or remove it first")
     if args.password_file is None:
         parser.error("--password-file is required unless --remove is used")
     if not 1 <= args.port <= 65535 or not 1 <= args.fps <= 30:
