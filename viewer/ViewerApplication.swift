@@ -25,6 +25,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var clipboardButton: NSButton!
     private var sendButton: NSButton!
     private var controlsToggleButton: NSButton!
+    private var autoHideControlsButton: NSButton!
     private var controlPanel: NSGlassEffectView!
     private var connectionRow: NSStackView!
     private var connectionFooter: NSStackView!
@@ -176,7 +177,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         sendButton.imagePosition = .imageLeading
         sendButton.toolTip = "Send text already on the Mac clipboard. Negotiated UTF-8 or Latin-1 fallback, up to 1 MiB per encoded transfer."
         sendButton.isEnabled = false
-        let options = NSStackView(views: [clipboardButton, sendButton])
+        autoHideControlsButton = NSButton(checkboxWithTitle: "Hide controls after connecting", target: self, action: #selector(changeAutoHideControls(_:)))
+        autoHideControlsButton.font = .systemFont(ofSize: 12)
+        autoHideControlsButton.state = UserDefaults.standard.bool(forKey: "autoHideControlsAfterConnecting") ? .on : .off
+        autoHideControlsButton.toolTip = "Hide controls once after each successful connection. Show Controls keeps them visible until the next connection. This setting is saved on this Mac."
+        let options = NSStackView(views: [clipboardButton, sendButton, autoHideControlsButton])
         options.orientation = .horizontal
         options.alignment = .centerY
         options.spacing = 12
@@ -321,6 +326,13 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeFirstResponder(hostField)
+    }
+
+    @objc private func changeAutoHideControls(_ sender: Any?) {
+        UserDefaults.standard.set(autoHideControlsButton.state == .on, forKey: "autoHideControlsAfterConnecting")
+        if ready && autoHideControlsButton.state == .on && !controlPanel.isHidden {
+            toggleControls(nil)
+        }
     }
 
     @objc private func toggleControls(_ sender: Any?) {
@@ -483,7 +495,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             order = [desktop, statusField, statisticsButton, zoomControl, connectButton, controlsToggleButton]
         } else {
             order = [profilePopup, addProfileButton, editProfileButton, deleteProfileButton,
-                     hostField, portField, passwordField, connectButton, clipboardButton, sendButton,
+                     hostField, portField, passwordField, connectButton, clipboardButton, sendButton, autoHideControlsButton,
                      desktop, statusField, statisticsButton, zoomControl, controlsToggleButton]
         }
         for index in order.indices { order[index].nextKeyView = order[(index + 1) % order.count] }
@@ -805,6 +817,9 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if ready && !wasReady {
             pasteboardChange = pasteboard.changeCount
             window.makeFirstResponder(desktop)
+            if autoHideControlsButton.state == .on && !controlPanel.isHidden {
+                toggleControls(nil)
+            }
         }
         if connectionState != update.state {
             showStatus(update.state.message)

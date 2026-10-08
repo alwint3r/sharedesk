@@ -121,6 +121,8 @@ Connection controls use native AppKit Liquid Glass in light and dark appearance,
 
 Use **Hide Controls** in the footer to collapse the top panel and give the desktop more space; **Show Controls** restores it. Connect/Disconnect stays available in the footer while collapsed. Fields and clipboard settings are retained, and controls start visible on each launch. Connection validation errors reveal the fields when input is needed.
 
+Enable **Hide controls after connecting** beside the clipboard controls to collapse the panel after each successful connection, including reconnects and MCP-created connections. It is off by default and saved in this Mac's application preferences, not per profile. Enabling it while already connected hides the panel immediately. **Show Controls** keeps the panel visible for the rest of that connection without disabling the setting. Failed connection attempts do not hide the panel.
+
 The ordinary development app requires the Homebrew libraries on the Mac where it runs. Use the [private installer](#install-the-mac-viewer) for a self-contained copy.
 
 One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
