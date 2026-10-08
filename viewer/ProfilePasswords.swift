@@ -1,10 +1,12 @@
 import Foundation
 import Security
+import SharedeskMCPKeychain
 
 // Keychain items are scoped to this viewer, an immutable credential reference,
 // and the exact endpoint. New passwords get new references, so a failed profile
 // file write cannot overwrite the password used by the previous saved profile.
-// Calls are main-thread-only and may block for a macOS authorization dialog.
+// Calls are synchronous and main-thread-only. Local operations may open a
+// macOS authorization dialog; MCP reads fail instead of requesting interaction.
 @MainActor
 enum ProfilePasswords {
     static let service = "net.sharedesk.viewer.vnc-password"
@@ -18,12 +20,21 @@ enum ProfilePasswords {
         guard result == errSecSuccess else { throw PasswordError.keychain(result) }
     }
 
-    static func read(reference: UUID, target: ConnectionTarget) throws -> String {
+    enum ReadMode { case interactive, noninteractive }
+
+    static func read(reference: UUID, target: ConnectionTarget, mode: ReadMode = .interactive) throws -> String {
         var query = query(reference: reference, target: target)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
         var data: CFTypeRef?
-        let result = SecItemCopyMatching(query as CFDictionary, &data)
+        let result: OSStatus
+        switch mode {
+        case .interactive: result = SecItemCopyMatching(query as CFDictionary, &data)
+        case .noninteractive:
+            var retained: Unmanaged<CFTypeRef>?
+            result = sd_mcp_keychain_read(query as CFDictionary, &retained)
+            data = retained?.takeRetainedValue()
+        }
         guard result == errSecSuccess else { throw PasswordError.keychain(result) }
         guard let bytes = data as? Data, let password = String(data: bytes, encoding: .ascii), validVNCPassword(password) else {
             throw PasswordError.invalidPassword
@@ -52,6 +63,9 @@ enum PasswordError: Error, LocalizedError {
         case .keychain(let status):
             if status == errSecItemNotFound { return "The saved password is missing from Keychain. Enter it again or edit the profile." }
             if status == errSecUserCanceled { return "Keychain access was cancelled." }
+            if status == errSecInteractionNotAllowed {
+                return "The saved VNC password needs local Keychain approval. Connect to this profile in Sharedesk first, then retry. MCP cannot open a Keychain dialog."
+            }
             let reason = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
             return "Keychain could not complete the operation: \(reason)"
         }

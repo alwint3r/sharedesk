@@ -19,17 +19,22 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     private let denyButton = NSButton(title: "Deny", target: nil, action: nil)
     private let controlButton = NSButton(checkboxWithTitle: "Allow MCP Control", target: nil, action: nil)
     private let controlStatus = NSTextField(wrappingLabelWithString: "Control off.")
+    private let connectionButton = NSButton(checkboxWithTitle: "Allow MCP Connection Management", target: nil, action: nil)
+    private let connectionStatus = NSTextField(wrappingLabelWithString: "Connection management off.")
 
     init(
         snapshot: @escaping () -> MCPDesktopSnapshot,
         submitInput: @escaping (VNCInputPlan) throws -> VNCInputHandle,
+        listProfiles: @escaping () throws -> [MCPConnectionProfile],
+        manageConnection: @escaping (MCPConnectionRequest) throws -> UUID,
         copyLocal: @escaping (String) -> Bool
     ) {
-        self.server = MCPServer(snapshot: snapshot, submitInput: submitInput)
+        self.server = MCPServer(snapshot: snapshot, submitInput: submitInput,
+                                listProfiles: listProfiles, manageConnection: manageConnection)
         self.copyLocal = copyLocal
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 780),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -49,8 +54,10 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
             "A trusted MCP client on this Mac can read connection status and take screenshots " +
             "of the current Ubuntu desktop. Screenshots may contain sensitive information. " +
             "The client may store them or send them to its AI provider.\n\n" +
-            "Input is off by default. If enabled below, clients can act with your Ubuntu user's permissions, " +
-            "including destructive actions. No clipboard or connection-control tools."
+            "Clients can also list saved profile names; names may contain private information. " +
+            "Input and connection management are off by default. If enabled below, input can perform destructive " +
+            "actions as your Ubuntu user; connection management can choose a saved desktop or disconnect yours. " +
+            "No passwords are returned. No clipboard tools."
         )
         privacyNotice.font = .systemFont(ofSize: 12)
         statusField.font = .systemFont(ofSize: 12, weight: .medium)
@@ -100,10 +107,15 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         controlButton.toolTip = "Allow bounded mouse and keyboard actions for this connection only. Local clicks, scrolling or keys revoke control."
         controlStatus.font = .systemFont(ofSize: 11)
         controlStatus.textColor = .secondaryLabelColor
+        connectionButton.target = self
+        connectionButton.action = #selector(changeConnectionPermission(_:))
+        connectionButton.toolTip = "Allow all authorized clients to connect saved profiles, disconnect, or retry an ended connection. Survives VNC disconnects; resets on Stop or sign-in revocation."
+        connectionStatus.font = .systemFont(ofSize: 11)
+        connectionStatus.textColor = .secondaryLabelColor
 
         let stack = NSStackView(views: [
             heading, privacyNotice, statusField, endpointField,
-            controlButton, controlStatus, lifecycleNotice, buttons, copyStatus,
+            controlButton, controlStatus, connectionButton, connectionStatus, lifecycleNotice, buttons, copyStatus,
             authorizationStatus, approvalField, approvalButtons
         ])
         stack.orientation = .vertical
@@ -111,7 +123,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for field in [privacyNotice, statusField, controlStatus, lifecycleNotice, copyStatus, authorizationStatus, approvalField] {
+        for field in [privacyNotice, statusField, controlStatus, connectionStatus, lifecycleNotice, copyStatus, authorizationStatus, approvalField] {
             field.widthAnchor.constraint(equalToConstant: 580).isActive = true
         }
 
@@ -148,6 +160,13 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         controlButton.isEnabled = server.controlAvailable
         controlButton.state = server.controlEnabled ? .on : .off
         controlStatus.stringValue = server.controlStatus
+        connectionButton.isEnabled = server.endpoint != nil
+        connectionButton.state = server.connectionManagementEnabled ? .on : .off
+        connectionStatus.stringValue = server.connectionManagementStatus
+    }
+
+    @objc private func changeConnectionPermission(_ sender: Any?) {
+        server.setConnectionManagementEnabled(connectionButton.state == .on)
     }
 
     @objc private func changeControlPermission(_ sender: Any?) {
@@ -168,7 +187,8 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         alert.messageText = "Authorize this sign-in for up to 30 days?"
         alert.informativeText = "Approve only if you started sign-in in your MCP client and the browser shows \(code). " +
             "The client can read screenshots whenever you start this server, including future VNC connections. " +
-            "Screenshots may reach its AI provider. Input also requires Allow MCP Control."
+            "Profile names and screenshots may reach its AI provider. Input requires Allow MCP Control; " +
+            "choosing or disconnecting a desktop requires Allow MCP Connection Management."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Approve")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -187,7 +207,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         guard server.endpoint != nil, let window else { return }
         let alert = NSAlert()
         alert.messageText = "Revoke every remembered MCP sign-in?"
-        alert.informativeText = "This turns control off, cancels unfinished MCP actions and invalidates all client credentials. " +
+        alert.informativeText = "This turns input control and connection management off, cancels unfinished MCP actions and invalidates all client credentials. " +
             "The VNC connection stays open. Sign in again from your MCP client. Its configuration does not change."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Revoke Sign-Ins")

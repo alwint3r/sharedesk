@@ -16,4 +16,10 @@
  * return the restoration status. An error can therefore follow a saved write. */
 OSStatus sd_mcp_keychain_write(CFDictionaryRef query, CFDataRef data, bool creating);
 
+/* Main-thread-only, synchronous read, with authentication UI disabled and
+ * the previous interaction setting restored before returning when possible.
+ * The caller owns query for the call and releases the returned result.
+ * On any error, including restoration failure, result is NULL. */
+OSStatus sd_mcp_keychain_read(CFDictionaryRef query, CFTypeRef *result);
+
 #endif

@@ -11,13 +11,19 @@ struct MCPDesktopSnapshot {
 }
 
 // Stateless Streamable HTTP. The viewer owns Start/Stop and the
-// snapshot and input providers. No blocking VNC calls, pasteboard access,
-// files or logging here. Input is denied unless explicitly enabled locally.
+// snapshot, input and connection providers. No blocking VNC calls, pasteboard
+// access, files or logging here. Input and connection changes need separate
+// local permissions. Connection requests return acceptance without waiting
+// for VNC completion; the viewer's credential read is synchronous.
 @MainActor
 final class MCPServer {
     private let supportedVersions = ["2025-11-25", "2025-06-18", "2025-03-26"]
     private let snapshot: () -> MCPDesktopSnapshot
     private let submitInput: (VNCInputPlan) throws -> VNCInputHandle
+    private let listProfiles: () throws -> [MCPConnectionProfile]
+    private let manageConnection: (MCPConnectionRequest) throws -> UUID
+    private(set) var connectionManagementEnabled = false
+    private(set) var connectionManagementStatus = "Connection management off."
     private var controlConnectionID: UUID?
     private(set) var controlStatus = "Control off."
 
@@ -61,14 +67,19 @@ final class MCPServer {
 
     init(
         snapshot: @escaping () -> MCPDesktopSnapshot,
-        submitInput: @escaping (VNCInputPlan) throws -> VNCInputHandle
+        submitInput: @escaping (VNCInputPlan) throws -> VNCInputHandle,
+        listProfiles: @escaping () throws -> [MCPConnectionProfile],
+        manageConnection: @escaping (MCPConnectionRequest) throws -> UUID
     ) {
         self.snapshot = snapshot
         self.submitInput = submitInput
+        self.listProfiles = listProfiles
+        self.manageConnection = manageConnection
         authorization.didChange = { [weak self] in self?.didChange?() }
         authorization.didRevokeAccess = { [weak self] reportingConnection in
             guard let self else { return }
             self.revokeControl(reason: "MCP authorization revoked.")
+            self.setConnectionManagementEnabled(false)
             self.screenshotTask?.cancel()
             self.screenshotRequestID = nil
             self.screenshotConnection = nil
@@ -114,6 +125,17 @@ final class MCPServer {
         } else {
             didChange?()
         }
+    }
+
+    // Unlike input control, this permission survives VNC disconnects so that
+    // an approved client can retry. Only local UI can grant it; Stop and
+    // authorization revocation always clear it. No deferred connection work.
+    func setConnectionManagementEnabled(_ enabled: Bool) {
+        connectionManagementEnabled = enabled && port != nil
+        connectionManagementStatus = connectionManagementEnabled
+            ? "Enabled for all authorized clients, across VNC disconnects. New connections start with clipboard and input control off."
+            : "Connection management off."
+        didChange?()
     }
 
     // MARK: - Explicit server lifecycle
@@ -224,6 +246,7 @@ final class MCPServer {
     }
 
     func stop() {
+        setConnectionManagementEnabled(false)
         revokeControl(reason: "MCP server stopped.")
         runID = UUID() // Invalidates callbacks and encoded images from this run.
         startDeadline?.cancel()
@@ -457,7 +480,10 @@ final class MCPServer {
                 "instructions": "Access to the viewer's current remote desktop. Screenshots may contain sensitive information. " +
                     "Input requires the viewer's Allow MCP Control switch. Use target from current status or screenshot metadata. " +
                     "Pointer coordinates are full remote pixels; scale resized PNG coordinates using its metadata. " +
-                    "Input can perform destructive actions as the logged-in Ubuntu user. No clipboard or connection-control tools."
+                    "Input can perform destructive actions as the logged-in Ubuntu user. No clipboard tools. " +
+                    "Saved-profile connection changes require the separate Allow MCP Connection Management switch. " +
+                    "They return acceptance; poll status for completion. Reconnect only retries an ended connection. " +
+                    "New connections start with clipboard sharing and input control off."
             ])
 
         case "ping":
@@ -494,7 +520,7 @@ final class MCPServer {
                     ]
                 ] as [String: Any]
             }
-            sendRPCResult(client, id: requestID, result: ["tools": tools + MCPControl.tools])
+            sendRPCResult(client, id: requestID, result: ["tools": tools + MCPControl.tools + MCPConnections.tools])
 
         case "tools/call":
             guard let toolName = parameters["name"] as? String, parameters["task"] == nil else {
@@ -502,6 +528,30 @@ final class MCPServer {
                     client, id: requestID, code: -32602,
                     message: "Expected a tool name; task execution is not supported"
                 )
+                return
+            }
+            if MCPConnections.names.contains(toolName) {
+                guard connectionManagementEnabled, port != nil else {
+                    sendToolError(client, id: requestID, message: "Connection management is off. Enable Allow MCP Connection Management in the viewer.")
+                    return
+                }
+                guard let arguments = parameters["arguments"] as? [String: Any] else {
+                    sendToolError(client, id: requestID, message: "Connection tools require a profile_id or connection_id.")
+                    return
+                }
+                do {
+                    let operation = try MCPConnections.request(tool: toolName, arguments: arguments)
+                    let id = try manageConnection(operation)
+                    let data = try JSONSerialization.data(
+                        withJSONObject: ["accepted": true, "connection_id": id.uuidString], options: [.sortedKeys]
+                    )
+                    sendRPCResult(client, id: requestID, result: [
+                        "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
+                        "isError": false
+                    ])
+                } catch {
+                    sendToolError(client, id: requestID, message: error.localizedDescription)
+                }
                 return
             }
             if MCPControl.names.contains(toolName) {
@@ -570,6 +620,18 @@ final class MCPServer {
 
             let current = snapshot()
             switch toolName {
+            case "list_connection_profiles":
+                do {
+                    let profiles = try listProfiles().map { ["profile_id": $0.id.uuidString, "name": $0.name] }
+                    let data = try JSONSerialization.data(withJSONObject: ["profiles": profiles], options: [.sortedKeys])
+                    sendRPCResult(client, id: requestID, result: [
+                        "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
+                        "isError": false
+                    ])
+                } catch {
+                    sendToolError(client, id: requestID, message: error.localizedDescription)
+                }
+
             case "get_connection_status":
                 let stateName: String
                 switch current.state {
@@ -581,6 +643,10 @@ final class MCPServer {
                 let image = current.state.ready ? current.image : nil
                 let connectionStatus: [String: Any] = [
                     "state": stateName,
+                    // Retain the last attempt's identity after disconnection,
+                    // independent of screenshot availability and dimensions.
+                    "connection_id": current.connectionID.map { $0.uuidString as Any } ?? NSNull(),
+                    "connectionManagementEnabled": connectionManagementEnabled,
                     "width": image.map { $0.width as Any } ?? NSNull(),
                     "height": image.map { $0.height as Any } ?? NSNull(),
                     "screenshotAvailable": image != nil,

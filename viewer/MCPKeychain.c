@@ -61,4 +61,34 @@ OSStatus sd_mcp_keychain_write(CFDictionaryRef query, CFDataRef data, bool creat
     }
     return restore_status;
 }
+
+OSStatus sd_mcp_keychain_read(CFDictionaryRef query, CFTypeRef *result)
+{
+    if (result) {
+        *result = NULL;
+    }
+    if (!pthread_main_np() || !query || !result) {
+        return errSecParam;
+    }
+
+    Boolean previous_interaction_allowed;
+    OSStatus status = SecKeychainGetUserInteractionAllowed(&previous_interaction_allowed);
+    if (status != errSecSuccess) {
+        return status;
+    }
+    status = SecKeychainSetUserInteractionAllowed(false);
+    if (status != errSecSuccess) {
+        (void)SecKeychainSetUserInteractionAllowed(previous_interaction_allowed);
+        return status;
+    }
+
+    OSStatus read_status = SecItemCopyMatching(query, result);
+    OSStatus restore_status = SecKeychainSetUserInteractionAllowed(previous_interaction_allowed);
+    status = read_status != errSecSuccess ? read_status : restore_status;
+    if (status != errSecSuccess && *result) {
+        CFRelease(*result);
+        *result = NULL;
+    }
+    return status;
+}
 #pragma clang diagnostic pop

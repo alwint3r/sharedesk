@@ -1,6 +1,14 @@
 import AppKit
 import Darwin
 
+// Content-free identity/history of the actual connection attempt, not a copy
+// of editable profile settings. Needed to reject stale disconnect/retry calls.
+private struct ViewerConnectionRecord {
+    let id: UUID
+    let profileID: UUID?
+    let target: ConnectionTarget
+}
+
 @MainActor
 final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private var window: NSWindow!
@@ -35,10 +43,11 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var zoomControl: NSSegmentedControl!
     private let zoomLevels: [CGFloat] = [1, 1.25, 1.5, 2, 3, 4]
     private var session: VNCSession?
+    private var connectionRecord: ViewerConnectionRecord?
     private var connectionState: SessionState = .finished(.disconnected)
     private var sessionEstablished = false
     // Connection fields remain the endpoint/settings source of truth. No
-    // separate reconnect profile, password cache or automatic retry timer.
+    // separate editable reconnect settings, password cache or automatic retry timer.
     private var timer: Timer?
     private var pasteboard = NSPasteboard.general // Main thread only; never the worker.
     private var pasteboardChange = 0
@@ -353,8 +362,15 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 // Read live state without consuming poll events or sampling the
                 // socket. This closes the gap before the next UI poll on loss.
                 let status = self.session?.connectionStatus()
-                let state = status?.state ?? self.connectionState
-                return MCPDesktopSnapshot(connectionID: status?.id, state: state,
+                let state: SessionState
+                if let status, case .finished(let reason) = status.state {
+                    // The worker ended, but the UI has not released its session
+                    // yet. Report cleanup until a new connection can be accepted.
+                    state = .stopping(reason)
+                } else {
+                    state = status?.state ?? self.connectionState
+                }
+                return MCPDesktopSnapshot(connectionID: status?.id ?? self.connectionRecord?.id, state: state,
                                           image: state.ready && self.ready ? self.desktop.framebufferSnapshot : nil)
             }, submitInput: { [weak self] plan in
                 guard let self, let session = self.session else {
@@ -364,6 +380,43 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 // local input. Do not synthesize AppKit events here: those
                 // handlers also synchronize the clipboard.
                 return try session.beginInputAction(plan)
+            }, listProfiles: { [weak self] in
+                guard let self, self.profileStore.loaded else { throw ProfileError.unavailable }
+                return self.profileStore.profiles.map { MCPConnectionProfile(id: $0.id, name: $0.name) }
+            }, manageConnection: { [weak self] request in
+                guard let self, !self.terminating else {
+                    throw MCPConnectionError(message: "The viewer is unavailable or quitting. Nothing was changed.")
+                }
+                switch request {
+                case .connectProfile(let id):
+                    guard self.profileStore.loaded else { throw ProfileError.unavailable }
+                    guard let profile = self.profileStore.profiles.first(where: { $0.id == id }) else {
+                        throw MCPConnectionError(message: "The saved profile no longer exists. List profiles again.")
+                    }
+                    return try self.connectMCPProfile(profile)
+
+                case .disconnectConnection(let id):
+                    guard let session = self.session, session.connectionStatus().id == id else {
+                        throw MCPConnectionError(message: "The current connection does not match connection_id. Get current status; nothing was disconnected.")
+                    }
+                    self.stopConnection(session)
+                    return id
+
+                case .reconnectConnection(let id):
+                    guard self.session == nil else {
+                        throw MCPConnectionError(message: "Wait until the connection has ended. Disconnect an active connection explicitly first.")
+                    }
+                    guard self.profileStore.loaded else { throw ProfileError.unavailable }
+                    guard let record = self.connectionRecord, record.id == id,
+                          let profileID = record.profileID,
+                          let profile = self.profileStore.profiles.first(where: { $0.id == profileID }),
+                          profile.target == record.target,
+                          self.selectedProfile?.id == profileID,
+                          (try? ConnectionTarget(host: self.hostField.stringValue, portText: self.portField.stringValue)) == record.target else {
+                        throw MCPConnectionError(message: "The last connection, selected profile or endpoint changed, or the last attempt was not a saved-profile connection. Get current status and use connect_profile explicitly.")
+                    }
+                    return try self.connectMCPProfile(profile)
+                }
             }, copyLocal: { [weak self] text in self?.copyMCPConfiguration(text) ?? false })
             mcpWindow?.window?.center()
         }
@@ -455,14 +508,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     @objc private func connect(_ sender: Any?) {
         if let session {
-            desktop.releaseInput()
-            session.stop()
-            ready = false
-            desktop.clearDesktop()
-            updateZoomControls()
-            sendButton.isEnabled = false
-            showStatus("Disconnecting…")
-            showConnectionState(.stopping(.disconnected))
+            stopConnection(session)
             return
         }
         let recovering = connectionState.finished && connectionState != .finished(.disconnected)
@@ -489,11 +535,47 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             focusConnectionPassword()
             return
         }
+        _ = startConnection(target: target, password: password)
+    }
+
+    private func stopConnection(_ session: VNCSession) {
+        desktop.releaseInput()
+        session.stop()
+        ready = false
+        desktop.inputEnabled = false
+        desktop.clearDesktop()
+        updateZoomControls()
+        sendButton.isEnabled = false
+        showStatus("Disconnecting…")
+        showConnectionState(.stopping(.disconnected))
+    }
+
+    private func connectMCPProfile(_ profile: ConnectionProfile) throws -> UUID {
+        guard session == nil else {
+            throw MCPConnectionError(message: "A connection is connecting, connected or disconnecting. Nothing was changed. Wait for disconnected status.")
+        }
+        guard let reference = profile.passwordReference else {
+            throw MCPConnectionError(message: "This profile has no saved VNC password. Save it locally in Sharedesk; do not send passwords through MCP.")
+        }
+        // Read before changing the visible selection. Failure leaves local
+        // fields untouched. Never use a locally typed password or show a dialog.
+        let password = try ProfilePasswords.read(reference: reference, target: profile.target, mode: .noninteractive)
+        refreshProfiles(selectedID: profile.id)
+        profileChanged(nil)
+        clipboardButton.state = .off // Override, but never rewrite, the saved preference.
+        return startConnection(target: profile.target, password: password)
+    }
+
+    private func startConnection(target: ConnectionTarget, password: String) -> UUID {
         ready = false
         sessionEstablished = false
+        desktop.inputEnabled = false
         desktop.clearDesktop()
         updateZoomControls()
         let session = VNCSession(host: target.host, port: target.port, password: password)
+        let id = session.connectionStatus().id
+        let profile = selectedProfile
+        connectionRecord = ViewerConnectionRecord(id: id, profileID: profile?.target == target ? profile?.id : nil, target: target)
         self.session = session
         desktop.session = session
         session.setClipboardSharing(clipboardButton.state == .on)
@@ -507,6 +589,7 @@ final class ViewerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         updateProfileControls()
         session.start()
         window.makeFirstResponder(desktop)
+        return id
     }
 
     private func showStatus(_ message: String) {

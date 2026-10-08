@@ -17,7 +17,7 @@ set_source_files_properties(sharedesk-viewer.icns PROPERTIES MACOSX_PACKAGE_LOCA
 add_executable(sharedesk-viewer MACOSX_BUNDLE
     main.swift ViewerApplication.swift DesktopView.swift VNCSession.swift
     ConnectionProfiles.swift ProfilePasswords.swift ProfileEditor.swift ConnectionStatistics.swift
-    MCPServer.swift MCPHTTPConnection.swift MCPServerWindow.swift MCPControl.swift VNCInputAction.swift
+    MCPServer.swift MCPHTTPConnection.swift MCPServerWindow.swift MCPControl.swift MCPConnections.swift VNCInputAction.swift
     MCPAuthorization.swift MCPAuthorizationStore.swift
     VNCBridge.c MCPKeychain.c sharedesk-viewer.icns)
 target_include_directories(sharedesk-viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

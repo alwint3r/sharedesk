@@ -28,9 +28,15 @@ Optional MCP access
   Client compatibility is limited to the implemented OAuth profile; the
   repository README documents the verified client setup.
 
-  Authorized clients can read screenshots and may send them to an AI provider.
-  Allow MCP Control is a separate permission for mouse and keyboard input,
+  Authorized clients can read profile names and screenshots and may send them
+  to an AI provider. Allow MCP Control permits mouse and keyboard input,
   including potentially destructive actions on Ubuntu. It starts off.
+  Allow MCP Connection Management is a separate permission, also initially off.
+  It permits saved-profile connections, exact-ID disconnects and retries after
+  a connection ends. It survives VNC disconnects but resets on Stop or sign-in
+  revocation. Connections need an already-approved saved Keychain password;
+  MCP cannot request a password or open a Keychain approval dialog.
+  MCP-created connections start with clipboard sharing and input control off.
   Stop or closing the MCP window ends access now, but remembered approvals
   can return on the next Start for up to 30 days. Require Sign-In Again
   revokes remembered access. Installing an update does not revoke it.
