@@ -71,7 +71,7 @@ enum ProfileError: Error, LocalizedError {
         case .duplicateName: "Another profile already has that name. Choose a different name."
         case .invalidDocument: "The profile file contains duplicate identifiers or names. It was not changed."
         case .unavailable: "Profiles could not be loaded. The existing file will not be overwritten."
-        case .changedOnDisk: "The profile file changed outside this window. Reopen Sharedesk to load it before editing."
+        case .changedOnDisk: "The profile file changed outside Sharedesk. Quit and reopen Sharedesk to load it before editing."
         case .insecureFile: "The profile directory and file must be owned by you, private, and not symbolic links. Use permissions 700 for the directory and 600 for the file."
         case .tooLarge: "The profile file exceeds the 1 MiB limit. It was not changed."
         }

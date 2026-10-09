@@ -7,6 +7,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
     let server: MCPServer
     private let copyLocal: (String) -> Bool
 
+    private let targetField = NSTextField(wrappingLabelWithString: "")
     private let statusField = NSTextField(wrappingLabelWithString: "")
     private let endpointField = NSTextField(labelWithString: "Not listening")
     private let copyStatus = NSTextField(wrappingLabelWithString: "")
@@ -34,7 +35,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         self.copyLocal = copyLocal
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 780),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 850),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -59,6 +60,8 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
             "actions as your Ubuntu user; connection management can choose a saved desktop or disconnect yours. " +
             "No passwords are returned. No clipboard tools."
         )
+        targetField.font = .systemFont(ofSize: 12, weight: .medium)
+        targetField.setAccessibilityLabel("MCP connection window")
         privacyNotice.font = .systemFont(ofSize: 12)
         statusField.font = .systemFont(ofSize: 12, weight: .medium)
         endpointField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -114,7 +117,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         connectionStatus.textColor = .secondaryLabelColor
 
         let stack = NSStackView(views: [
-            heading, privacyNotice, statusField, endpointField,
+            heading, targetField, privacyNotice, statusField, endpointField,
             controlButton, controlStatus, connectionButton, connectionStatus, lifecycleNotice, buttons, copyStatus,
             authorizationStatus, approvalField, approvalButtons
         ])
@@ -123,7 +126,7 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for field in [privacyNotice, statusField, controlStatus, connectionStatus, lifecycleNotice, copyStatus, authorizationStatus, approvalField] {
+        for field in [targetField, privacyNotice, statusField, controlStatus, connectionStatus, lifecycleNotice, copyStatus, authorizationStatus, approvalField] {
             field.widthAnchor.constraint(equalToConstant: 580).isActive = true
         }
 
@@ -144,6 +147,11 @@ final class MCPServerWindow: NSWindowController, NSWindowDelegate {
 
     required init?(coder: NSCoder) {
         fatalError("MCPServerWindow uses a programmatic window")
+    }
+
+    func updateTarget(_ title: String) {
+        window?.title = "MCP Server — \(title)"
+        targetField.stringValue = "Connection window: \(title)\nChanging focus does not change this target. To choose another window, close this panel, focus that window, then open MCP Server again."
     }
 
     private func refresh() {

@@ -4,7 +4,7 @@ A small private remote-desktop application: an **Ubuntu X11 host** and a **nativ
 
 This is an early VNC application, not an AnyDesk-compatible client. Normal manual/per-user startup requires an already logged-in X11 desktop. An [opt-in Ubuntu 22.04 GDM/Xorg service](#enable-access-before-ubuntu-login) can also share the login screen after boot. Do not run the network-facing host as root or expose its port to the internet. The X11 server must provide the XTEST, XFIXES and XKEYBOARD extensions; Ubuntu's normal Xorg session provides them.
 
-The **0.1 private viewer** on `main` includes profiles, Unicode text clipboard sharing, zoom, manual connection recovery, statistics, and opt-in MCP access. MCP no longer requires a separate experiment branch. This remains a private build, not a public release or a claim of compatibility with every MCP client.
+The **0.1 private viewer** on `main` includes multiple connection windows, profiles, Unicode text clipboard sharing, zoom, manual connection recovery, statistics, and opt-in MCP access. MCP no longer requires a separate experiment branch. This remains a private build, not a public release or a claim of compatibility with every MCP client.
 
 ## Repository layout
 
@@ -23,7 +23,8 @@ host/
 viewer/
   CMakeLists.txt               # Viewer target and dependencies
   main.swift                  # Application entry point
-  ViewerApplication.swift     # Window, controls and main-thread clipboard
+  ViewerApplication.swift     # App menus, window lifecycle and shared settings
+  ViewerWindow.swift          # Per-window connection, controls and main-thread clipboard
   DesktopView.swift           # Rendering, cursor and input
   VNCSession.swift            # Worker, session state, queues and deadlines
   VNCInputAction.swift        # Bounded input plans, release state and completion handles
@@ -119,13 +120,15 @@ CMake builds the viewer on macOS and the host on Linux. The viewer uses Swift an
 
 Connection controls use native AppKit Liquid Glass in light and dark appearance, with a separate rounded remote-desktop canvas and a connection-state footer. Glass stays off the remote image.
 
-Use **Hide Controls** in the footer to collapse the top panel and give the desktop more space; **Show Controls** restores it. Connect/Disconnect stays available in the footer while collapsed. Fields and clipboard settings are retained, and controls start visible on each launch. Connection validation errors reveal the fields when input is needed.
+Use **File → New Connection Window** (**Cmd+N**) to manage another host without disconnecting the first. Each window has its own connection, password field, recovery state, zoom, controls and statistics. Window titles identify the profile and endpoint; use the **Window** menu to switch between them. Saved profiles and the auto-hide preference are shared across windows. Closing a connection window disconnects only that window and closes its statistics and MCP panels. Closing the last window leaves Sharedesk running: use Cmd+N or click its Dock icon to open another. **Quit Sharedesk** disconnects all windows and waits for their networking workers to finish. Each Ubuntu host still accepts only one viewer at a time.
 
-Enable **Hide controls after connecting** beside the clipboard controls to collapse the panel after each successful connection, including reconnects and MCP-created connections. It is off by default and saved in this Mac's application preferences, not per profile. Enabling it while already connected hides the panel immediately. **Show Controls** keeps the panel visible for the rest of that connection without disabling the setting. Failed connection attempts do not hide the panel.
+Use **Hide Controls** in the footer to collapse the top panel and give the desktop more space; **Show Controls** restores it. Connect/Disconnect stays available in the footer while collapsed. Fields and clipboard settings are retained, and controls start visible in each new window. Connection validation errors reveal the fields when input is needed.
+
+Enable **Hide controls after connecting** beside the clipboard controls to collapse the panel after each successful connection, including reconnects and MCP-created connections. It is off by default and saved in this Mac's application preferences, not per profile. Enabling it hides the controls in all currently connected windows immediately. **Show Controls** keeps the panel visible for the rest of that connection without disabling the setting. Failed connection attempts do not hide the panel.
 
 The ordinary development app requires the Homebrew libraries on the Mac where it runs. Use the [private installer](#install-the-mac-viewer) for a self-contained copy.
 
-One dedicated networking worker owns the C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
+Each connection has a dedicated networking worker that owns its C client and writable framebuffer. Swift owns session state, bounded outgoing queues, elapsed-time deadlines and cancellation. A lock transfers the latest immutable frame, cursor and clipboard snapshots to the main thread. AppKit rendering, input handling and pasteboard access stay on the main thread; blocking library calls do not run in Swift Tasks or actors. Clipboard and shortcut behavior are unchanged by the language migration.
 
 Disconnect Screen Sharing first; the host accepts one viewer at a time. Enter Ubuntu's **numeric Tailscale IPv4**, port **5901**, and the same VNC password as the host, then click **Connect**. The viewer also allows loopback IPv4 for local connections. DNS names, public addresses, unauthenticated servers, and IPv6 are not supported. Passwords are cleared from the field when connecting. Manual connections do not save passwords; connection profiles can optionally remember them in macOS Keychain. Reconnects remain explicit, through the viewer or the opt-in MCP connection tools.
 
@@ -141,15 +144,15 @@ The desktop starts in **Fit** mode, showing the whole remote image. The footer h
 
 When zoomed, drag the local horizontal/vertical scrollbars to navigate the enlarged image. Mouse-wheel and trackpad scrolling over the desktop still go to Ubuntu, not the local viewport. No pinch-zoom or new keyboard shortcuts are added. Resizing the window, collapsing the controls and host resolution changes retain the chosen zoom and visible region where scroll bounds allow it. Host resolution changes replace the framebuffer without reconnecting. Mouse clicks, dragging and cursor shapes remain supported; Ubuntu cursor-position messages do not move the Mac's global pointer.
 
-Keyboard input initially targets English (US) direct keys, including Shift punctuation, navigation, F1–F12 and shortcuts. **Control maps to Ubuntu Ctrl, Option to Alt, and Command to Super**, not Ctrl. Cmd+Q and Cmd+W stay local. Key-up uses the remembered key-down symbol; Mac repeat events are ignored because the host owns repeat. Losing focus releases held input. IME composition and dead-key text entry are not supported yet.
+Keyboard input initially targets English (US) direct keys, including Shift punctuation, navigation, F1–F12 and shortcuts. **Control maps to Ubuntu Ctrl, Option to Alt, and Command to Super**, not Ctrl. Cmd+Q, Cmd+W, Cmd+N, Cmd+M and the macOS window-cycling shortcut stay local. Key-up uses the remembered key-down symbol; Mac repeat events are ignored because the host owns repeat. Losing focus releases held input. IME composition and dead-key text entry are not supported yet.
 
-For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while Sharedesk is active and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. New Ubuntu copies update the Mac clipboard while sharing is enabled. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
+For clipboard sharing, enable **`--clipboard` on the Ubuntu host** and check **Share text clipboard** in the viewer. Copy text on the Mac, return to Sharedesk, then paste in Ubuntu using that application's paste action. New Mac text is checked while its connection window is focused and Sharedesk is active, and before keyboard or mouse-button events, so clipboard messages are queued before paste actions. Only that focused connection window can import new Ubuntu copies into the Mac clipboard; copies received by background windows are discarded. Switching connection windows does not automatically send existing Mac text, and remote copies are never automatically forwarded to another host. Neither side exports an old clipboard automatically on connection; use **Send Clipboard** to send text already copied on the Mac. Enabling the checkbox also starts from the current clipboard change count, without sending an old copy.
 
 Clipboard sharing is off by default in both programs. UTF-8 is negotiated when both sides support the standard Extended Clipboard extension. Older peers retain lossless Latin-1 sharing; unsupported Unicode is rejected with a status message. The checkbox tooltip shows whether UTF-8 was negotiated. NUL-containing text and transfers over the encoded byte limit are rejected without shortening them. It keeps clipboard data in memory only. See [Text clipboard sharing](#text-clipboard-sharing) for host setup and privacy details. Successful local protocol checks do not replace normal use against your actual Ubuntu desktop.
 
 ### Viewer connection statistics
 
-Click **Stats** in the footer to open the non-modal **Connection Statistics** window. It is available with the top controls shown or hidden, and starts closed each launch. Opening it releases held remote keys/buttons but does not pause the connection. Closing it stops statistics sampling without disconnecting.
+Click **Stats** in a connection window's footer to open its non-modal **Connection Statistics** window. It is available with the top controls shown or hidden, and starts closed each launch. Opening it releases held remote keys/buttons but does not pause the connection. Closing it stops statistics sampling without disconnecting.
 
 The panel refreshes about once per second using the existing UI timer. It shows:
 
@@ -168,7 +171,9 @@ These are content-free, in-memory counters. There are no statistics logs, export
 
 ### MCP access and control
 
-The viewer on `main` can expose its **current VNC connection** to a trusted MCP client on the same Mac. Pi is currently the verified client; its setup is documented below. It uses the viewer's single VNC session; it does not create a second session or change the Ubuntu host. Optional connection management can connect a saved profile, disconnect, or retry an ended connection. Use **Sharedesk → MCP Server… → Start Server**. The server starts with input control and connection management off and listens only at **`http://127.0.0.1:5917/mcp`**. If port 5917 is occupied, Start fails with a message; it never selects another port or stops the other process.
+The viewer on `main` can expose **one connection window's VNC session** to a trusted MCP client on the same Mac. Pi is currently the verified client; its setup is documented below. It uses that window's existing VNC session; it does not create a second session or change the Ubuntu host. Optional connection management can connect a saved profile, disconnect, or retry an ended connection. Use **Sharedesk → MCP Server… → Start Server**. The server starts with input control and connection management off and listens only at **`http://127.0.0.1:5917/mcp`**. If port 5917 is occupied, Start fails with a message; it never selects another port or stops the other process.
+
+Focus the connection window you want to expose before opening **MCP Server…**. The panel identifies its target window, and changing focus never redirects MCP access. There is one MCP endpoint for the app. Opening MCP Server again while its panel is open brings the existing target and panel forward. To change targets, close the MCP panel (which stops access), focus another connection window, then open MCP Server and start it again. MCP connection tools affect only the target window; other windows remain independent.
 
 #### Configure Pi once
 
@@ -195,7 +200,7 @@ This is **Streamable HTTP**, not legacy HTTP+SSE. The authorization profile is c
 
 #### Restart, revoke and sign in again
 
-The server remains **off each launch**. Start it manually when needed. **Stop**, closing the MCP window, closing the main viewer window, or quitting stops current access and discards access tokens. It does **not** erase remembered approvals: approved clients can refresh their credentials when you next start the server. The URL and Pi configuration stay unchanged. If Pi still shows disconnected, use `/mcp reconnect sharedesk`.
+The server remains **off each launch**. Start it manually when needed. **Stop**, closing the MCP window, closing its target connection window, or quitting stops current access and discards access tokens. It does **not** erase remembered approvals: approved clients can refresh their credentials when you next start the server. The URL and Pi configuration stay unchanged. If Pi still shows disconnected, use `/mcp reconnect sharedesk`.
 
 Access tokens last **five minutes**. Pi refreshes them automatically. Each native approval lasts at most **30 days**, including across viewer restarts; refreshing does not extend that deadline. After expiry, sign in and approve again. A VNC-only reconnect also leaves authentication in place, but resets **Allow MCP Control**.
 
@@ -280,11 +285,11 @@ Use **Add…** beside the profile selector to save a name, Tailscale/loopback IP
 
 **Remember password in macOS Keychain** is off by default for new profiles. Enable it and enter the VNC password to connect without typing it again. macOS may ask for Keychain access; a new development build may need renewed permission. The password field stays empty when a profile is selected. An entered password overrides the saved password for that connection only; it does not silently update Keychain.
 
-Use **Edit…** to rename a profile or change its settings. Leave the saved-password field blank to keep its existing password. Changing the address or port requires entering a new password if you want to keep Keychain storage enabled. Temporarily changing the main connection fields does not change the profile, and a saved password is never automatically reused for a different address or port. Profile editing is disabled while connecting or connected.
+Use **Edit…** to rename a profile or change its settings. Leave the saved-password field blank to keep its existing password. Changing the address or port requires entering a new password if you want to keep Keychain storage enabled. Temporarily changing the main connection fields does not change the profile, and a saved password is never automatically reused for a different address or port. Profile editing is disabled in a window while it is connecting, connected or disconnecting. You can edit profiles from another disconnected window. Profile lists update in all windows; changing a selected profile updates disconnected windows but never redirects an active connection.
 
 Disable **Remember password** in the editor to remove its Keychain item. **Delete…** removes the profile and attempts to remove its saved password, without changing the remote host. If Keychain removal fails, Sharedesk reports the partial success; remove the remaining **Sharedesk VNC** item through Keychain Access. The Keychain service is `net.sharedesk.viewer.vnc-password`. Long status messages are available in full by hovering over the status text.
 
-Settings live in `~/.sharedesk/profiles.json` on the Mac, with permission 600 inside a directory with permission 700. The JSON contains settings and optional credential references, never passwords. Writes replace the file atomically. Invalid, unreadable, oversized or externally changed files are not silently overwritten. Manual connections remain available if saved profiles cannot be loaded. Reopen the viewer after resolving a file error to reload its profiles.
+Settings live in `~/.sharedesk/profiles.json` on the Mac, with permission 600 inside a directory with permission 700. The JSON contains settings and optional credential references, never passwords. Writes replace the file atomically. Invalid, unreadable, oversized or externally changed files are not silently overwritten. Manual connections remain available if saved profiles cannot be loaded. Quit and reopen Sharedesk after resolving a file error to reload its profiles; opening another connection window does not reload the file.
 
 A profile can remember that clipboard sharing is enabled, but neither selecting it nor connecting sends an old clipboard snapshot. Clipboard privacy and opt-in behaviour remain unchanged; encoding is negotiated per connection.
 

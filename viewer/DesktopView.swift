@@ -83,7 +83,7 @@ final class DesktopScrollView: NSScrollView {
 @MainActor
 final class DesktopView: NSView {
     var session: VNCSession?
-    weak var controller: ViewerApplication?
+    weak var controller: ViewerWindow?
     var inputEnabled = false
     fileprivate var framebuffer: CGImage?
     fileprivate var imageScale: CGFloat = 1
@@ -340,7 +340,11 @@ final class DesktopView: NSView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if window?.firstResponder === self, event.modifierFlags.contains(.command) {
             let key = event.charactersIgnoringModifiers?.lowercased()
-            if key != "q", key != "w" { keyDown(with: event); return true }
+            // Keep window creation, closing, minimizing and cycling local.
+            if key != "q", key != "w", key != "n", key != "m", key != "`", key != "~" {
+                keyDown(with: event)
+                return true
+            }
         }
         return super.performKeyEquivalent(with: event)
     }

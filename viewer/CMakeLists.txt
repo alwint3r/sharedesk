@@ -15,7 +15,7 @@ find_library(CRYPTOKIT_FRAMEWORK CryptoKit)
 
 set_source_files_properties(sharedesk-viewer.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 add_executable(sharedesk-viewer MACOSX_BUNDLE
-    main.swift ViewerApplication.swift DesktopView.swift VNCSession.swift
+    main.swift ViewerApplication.swift ViewerWindow.swift DesktopView.swift VNCSession.swift
     ConnectionProfiles.swift ProfilePasswords.swift ProfileEditor.swift ConnectionStatistics.swift
     MCPServer.swift MCPHTTPConnection.swift MCPServerWindow.swift MCPControl.swift MCPConnections.swift VNCInputAction.swift
     MCPAuthorization.swift MCPAuthorizationStore.swift
